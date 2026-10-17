@@ -15,9 +15,9 @@ import sys
 import numpy as np
 
 from . import __version__
-from .format import DTYPE_F32, DTYPE_Q8_ROWS, read_trv, write_trv
+from .format import DTYPE_F32, DTYPE_Q4_G32, DTYPE_Q8_ROWS, read_trv, write_trv
 
-_DTYPE_NAMES = {DTYPE_F32: "f32", DTYPE_Q8_ROWS: "q8_rows"}
+_DTYPE_NAMES = {DTYPE_F32: "f32", DTYPE_Q8_ROWS: "q8_rows", DTYPE_Q4_G32: "q4_g32"}
 
 
 def _load_safetensors(path):
@@ -64,8 +64,16 @@ def cmd_export_modernbert(args):
     state = {}
     for path in files:
         state.update(_load_safetensors(path))
-    size, ignored = export_modernbert(state, cfg, args.output, group=args.group)
-    print(f"wrote {args.output}: {size / 1e6:.1f} MB")
+    report = []
+    size, ignored = export_modernbert(state, cfg, args.output, group=args.group,
+                                      weights=args.weights,
+                                      int4_max_error=args.int4_max_error, report=report)
+    print(f"wrote {args.output}: {size / 1e6:.1f} MB ({args.weights} weights)")
+    if report:
+        n4 = sum(1 for _, d, _ in report if d == "int4")
+        worst = max(report, key=lambda r: r[2])
+        print(f"auto precision: {n4}/{len(report)} matrices int4; "
+              f"largest int4 error {worst[2]:.3f} ({worst[0]})")
     if ignored:
         print(f"not part of the encoder, skipped ({len(ignored)}): " + ", ".join(ignored[:8])
               + (" ..." if len(ignored) > 8 else ""))
@@ -75,7 +83,7 @@ def cmd_inspect(args):
     tensors = read_trv(args.input, dequantize=False)
     total = 0
     for name, (dtype, val) in tensors.items():
-        shape = val[0].shape if dtype == DTYPE_Q8_ROWS else val.shape
+        shape = val[0].shape if dtype in (DTYPE_Q8_ROWS, DTYPE_Q4_G32) else val.shape
         n = int(np.prod(shape))
         total += n
         print(f"{_DTYPE_NAMES[dtype]:8s} {str(tuple(shape)):>20s}  {name}")
@@ -107,6 +115,10 @@ def main(argv=None):
     e.add_argument("-o", "--output", required=True)
     e.add_argument("--group", type=int, default=None,
                    help="activation quantization group (default: gcd(head_dim, intermediate))")
+    e.add_argument("--weights", choices=["int8", "int4", "auto"], default="int8",
+                   help="weight precision; auto picks int4 per matrix when its error is small")
+    e.add_argument("--int4-max-error", type=float, default=0.12,
+                   help="auto mode: largest relative int4 error accepted (default 0.12)")
     e.set_defaults(func=cmd_export_modernbert)
 
     i = sub.add_parser("inspect", help="list the tensors in a .trv file")

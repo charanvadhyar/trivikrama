@@ -25,6 +25,8 @@ trv_status trv_source_file_open(trv_source *src, trv_file_ctx *ctx, const char *
     ctx->n_reads = 0;
     src->read = file_read;
     src->ctx = ctx;
+    src->read_async = NULL;
+    src->wait = NULL;
     return TRV_OK;
 }
 

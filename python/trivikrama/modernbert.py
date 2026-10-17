@@ -18,7 +18,8 @@ import re
 import numpy as np
 
 from . import reference as ref
-from .format import DTYPE_F32, DTYPE_Q8_ROWS, read_trv, write_trv
+from .format import DTYPE_F32, DTYPE_Q4_G32, DTYPE_Q8_ROWS, read_trv, write_trv
+from .quantize import dequantize_q4_g32, quantize_q4_g32
 
 _RENAME = [
     (r"embeddings\.tok_embeddings\.weight", "emb.tok"),
@@ -111,14 +112,50 @@ def pick_group(cfg):
     return math.gcd(hd, cfg["intermediate_size"])
 
 
-def export_modernbert(state_dict, cfg, path, group=None):
-    """Write a ModernBERT encoder to a .trv file. Returns (file_bytes, ignored)."""
+def int4_error(w):
+    """Relative reconstruction error (Frobenius) of int4 group-32 quantization."""
+    q, s16 = quantize_q4_g32(w)
+    d = dequantize_q4_g32(q, s16)
+    return float(np.linalg.norm(d - w) / max(np.linalg.norm(w), 1e-30))
+
+
+def _order_key(name):
+    """config first, then layers in numeric order, then final norm, embeddings last.
+
+    Layer data ends up in forward order in the file, so a prefix of the file
+    (e.g. copied to internal flash as a fast tier) holds the earliest layers,
+    and the big embedding table, read only a row per token, sits at the end.
+    """
+    if name.startswith("trv."):
+        return (0, 0, name)
+    m = re.match(r"L(\d+)\.", name)
+    if m:
+        return (1, int(m.group(1)), name)
+    if name.startswith("final_norm"):
+        return (2, 0, name)
+    return (3, 0, name)
+
+
+def export_modernbert(state_dict, cfg, path, group=None, weights="int8", int4_max_error=0.12,
+                      report=None):
+    """Write a ModernBERT encoder to a .trv file. Returns (file_bytes, ignored).
+
+    weights: "int8", "int4", or "auto" (int4 for each layer matrix whose int4
+    reconstruction error is at most int4_max_error, int8 otherwise). The
+    embedding table always stays int8: only a few rows are read per inference,
+    so int4 would save storage but not time. report, if a list, receives
+    (name, chosen dtype name, int4 error) per layer matrix.
+    """
+    if weights not in ("int8", "int4", "auto"):
+        raise ValueError("weights must be 'int8', 'int4' or 'auto'")
     w, ignored = rename_state_dict(state_dict)
     H = cfg["hidden_size"]
     group = group or pick_group(cfg)
     hd = H // cfg["num_attention_heads"]
     if hd % group or cfg["intermediate_size"] % group:
         raise ValueError(f"group {group} must divide head_dim {hd} and intermediate size")
+    if weights != "int8" and group % 32 and 32 % group:
+        raise ValueError(f"int4 needs the activation group ({group}) and 32 to divide one another")
     config = np.array(
         [
             cfg["num_hidden_layers"],
@@ -136,9 +173,20 @@ def export_modernbert(state_dict, cfg, path, group=None):
         ("trv.modernbert.config", config, DTYPE_F32),
         ("trv.modernbert.layers", layers, DTYPE_F32),
     ]
-    for name in sorted(w):
-        dtype = DTYPE_Q8_ROWS if w[name].ndim == 2 else DTYPE_F32
-        tensors.append((name, w[name], dtype))
+    for name in sorted(w, key=_order_key):
+        arr = w[name]
+        if arr.ndim != 2:
+            dtype = DTYPE_F32
+        elif name == "emb.tok" or weights == "int8" or arr.shape[1] % 32:
+            dtype = DTYPE_Q8_ROWS
+        elif weights == "int4":
+            dtype = DTYPE_Q4_G32
+        else:
+            err = int4_error(arr)
+            dtype = DTYPE_Q4_G32 if err <= int4_max_error else DTYPE_Q8_ROWS
+            if report is not None:
+                report.append((name, "int4" if dtype == DTYPE_Q4_G32 else "int8", err))
+        tensors.append((name, arr, dtype))
     return write_trv(path, tensors), ignored
 
 
@@ -173,8 +221,29 @@ def _ln(x, g, b, eps):
     return (v + b if b is not None else v).astype(F32)
 
 
+def _lin_q4(xq, xs, G, wq, ws16, rows):
+    """Mirror of trv_linear_stream with Q4_G32 weights."""
+    T, K = xq.shape
+    c = min(G, 32)
+    nc = K // c
+    wq = wq[rows]
+    gs = ws16[rows].astype(F32)
+    acc = np.einsum(
+        "tjk,njk->tnj",
+        xq.reshape(T, nc, c).astype(np.int64),
+        wq.reshape(len(wq), nc, c).astype(np.int64),
+    )
+    s = np.zeros(acc.shape[:2], dtype=F32)
+    for j in range(nc):
+        k0 = j * c
+        s = s + (acc[:, :, j].astype(F32) * xs[:, None, k0 // G]) * gs[None, :, k0 // 32]
+    return s
+
+
 def _lin_q8g(xq, xs, G, wq, ws, rows):
-    """Mirror of trv_linear_q8g_stream for output rows `rows`."""
+    """Mirror of trv_linear_stream for output rows `rows` (int8 or int4 weights)."""
+    if ws.dtype == np.float16:
+        return _lin_q4(xq, xs, G, wq, ws, rows)
     T, K = xq.shape
     ng = K // G
     wq = wq[rows]

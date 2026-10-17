@@ -20,6 +20,26 @@
 static trv_model g_model;
 static trv_file_ctx g_fctx;
 
+static uint32_t g_dot_calls;
+
+/* A stand-in for a board's SIMD dot product: different code, same result. */
+static void dot_unrolled(const int8_t *x, const int8_t *w, uint32_t K, uint32_t chunk,
+                         int32_t *acc)
+{
+    uint32_t j, k;
+    ++g_dot_calls;
+    for (j = 0; j < K / chunk; ++j) {
+        const int8_t *a = x + j * chunk, *b = w + j * chunk;
+        int32_t s0 = 0, s1 = 0;
+        for (k = 0; k + 1 < chunk; k += 2) {
+            s0 += a[k] * b[k];
+            s1 += a[k + 1] * b[k + 1];
+        }
+        if (k < chunk) s0 += a[k] * b[k];
+        acc[j] = s0 + s1;
+    }
+}
+
 static void die(const char *what, trv_status st)
 {
     fprintf(stderr, "FAIL: %s (status %d)\n", what, (int)st);
@@ -93,6 +113,21 @@ int main(int argc, char **argv)
         if (g_fctx.bytes_read - before != w.nbytes) die("weights re-read", TRV_ERR_ARG);
     }
     save(out, "linear", y, T * N);
+
+    /* pluggable dot product: install a different implementation, same answer */
+    {
+        static float y2[MAXF];
+        trv_runtime rt;
+        memset(&rt, 0, sizeof rt);
+        rt.dot_groups = dot_unrolled;
+        trv_set_runtime(&rt);
+        st = trv_linear_q8_stream(&g_model, &w, xq, xs, T, b, 0, N, y2, N, tile, sizeof tile);
+        trv_set_runtime(NULL);
+        if (st != TRV_OK) die("linear with custom dot", st);
+        if (g_dot_calls == 0) die("custom dot product was not used", TRV_ERR_ARG);
+        if (memcmp(y, y2, sizeof(float) * T * N) != 0) die("custom dot changed the result", TRV_ERR_ARG);
+        printf("custom dot-product hook: used %u times, identical output\n", g_dot_calls);
+    }
 
     /* buffer-too-small path must be reported, not crash */
     st = trv_linear_q8_stream(&g_model, &w, xq, xs, T, b, 0, N, y, N, tile, K);

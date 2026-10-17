@@ -80,80 +80,6 @@ void trv_layernorm_quantize(const float *x, uint32_t T, uint32_t D, uint32_t ldx
     }
 }
 
-trv_status trv_linear_q8_stream(const trv_model *m, const trv_tensor *w,
-                                const int8_t *xq, const float *xscale, uint32_t T,
-                                const float *bias, uint32_t n_begin, uint32_t n_end,
-                                float *y, uint32_t ldy,
-                                void *tile_buf, uint32_t tile_bytes)
-{
-    if (!w || w->ndim != 2) return TRV_ERR_ARG;
-    return trv_linear_q8g_stream(m, w, xq, xscale, w->dims[1], T, bias, n_begin,
-                                 n_end, y, ldy, 0, tile_buf, tile_bytes);
-}
-
-trv_status trv_linear_q8g_stream(const trv_model *m, const trv_tensor *w,
-                                 const int8_t *xq, const float *xscale,
-                                 uint32_t group, uint32_t T,
-                                 const float *bias, uint32_t n_begin, uint32_t n_end,
-                                 float *y, uint32_t ldy, int accumulate,
-                                 void *tile_buf, uint32_t tile_bytes)
-{
-    uint32_t N, K, ng, rows_per_tile, n0;
-    uint8_t *buf = (uint8_t *)tile_buf;
-
-    if (!m || !w || !xq || !xscale || !y || !tile_buf) return TRV_ERR_ARG;
-    if (w->dtype != TRV_DTYPE_Q8_ROWS || w->ndim != 2) return TRV_ERR_ARG;
-    N = w->dims[0];
-    K = w->dims[1];
-    if (n_begin > n_end || n_end > N || K == 0) return TRV_ERR_ARG;
-    if (group == 0 || K % group != 0) return TRV_ERR_ARG;
-    ng = K / group;
-
-    rows_per_tile = tile_bytes / (K + 4u);
-    if (rows_per_tile == 0) return TRV_ERR_BUFFER;
-
-    for (n0 = n_begin; n0 < n_end; n0 += rows_per_tile) {
-        uint32_t r = n_end - n0;
-        uint32_t i;
-        const int8_t *rows;
-        if (r > rows_per_tile) r = rows_per_tile;
-
-        /* stride 1 of the three: bring one tile (scales + int8 rows) into RAM */
-        if (m->src->read(m->src->ctx, w->offset + 4u * n0, buf, 4u * r) != 0)
-            return TRV_ERR_IO;
-        if (m->src->read(m->src->ctx, w->offset + 4u * N + n0 * K,
-                         buf + 4u * r, r * K) != 0)
-            return TRV_ERR_IO;
-        rows = (const int8_t *)(buf + 4u * r);
-
-        /* apply the tile to every token before moving on */
-        for (i = 0; i < r; ++i) {
-            const int8_t *wr = rows + (size_t)i * K;
-            uint32_t n = n0 + i, t;
-            float ws, b = bias ? bias[n] : 0.0f;
-            memcpy(&ws, buf + 4u * i, 4); /* unaligned-safe */
-            for (t = 0; t < T; ++t) {
-                const int8_t *xr = xq + (size_t)t * K;
-                const float *xs = xscale + (size_t)t * ng;
-                float sum = 0.0f, val;
-                uint32_t g, k;
-                for (g = 0; g < ng; ++g) {
-                    int32_t acc = 0;
-                    for (k = g * group; k < (g + 1) * group; ++k)
-                        acc += (int32_t)xr[k] * (int32_t)wr[k];
-                    sum += (float)acc * xs[g];
-                }
-                val = sum * ws + b;
-                if (accumulate)
-                    y[(size_t)t * ldy + (n - n_begin)] += val;
-                else
-                    y[(size_t)t * ldy + (n - n_begin)] = val;
-            }
-        }
-    }
-    return TRV_OK;
-}
-
 void trv_layernorm(float *x, uint32_t T, uint32_t D, uint32_t ldx,
                    const float *gamma, const float *beta, float eps)
 {
@@ -201,6 +127,25 @@ void trv_geglu(const float *in, uint32_t T, uint32_t I, uint32_t ldin,
     }
 }
 
+void trv_rope_pos(float *x, uint32_t T, uint32_t n_heads, uint32_t head_dim,
+                  uint32_t ldx, const uint32_t *pos, float base)
+{
+    uint32_t half = head_dim / 2u, i, t, h;
+    for (i = 0; i < half; ++i) {
+        float inv_freq = powf(base, -2.0f * (float)i / (float)head_dim);
+        for (t = 0; t < T; ++t) {
+            float ang = (float)pos[t] * inv_freq;
+            float c = cosf(ang), s = sinf(ang);
+            for (h = 0; h < n_heads; ++h) {
+                float *xh = x + (size_t)t * ldx + (size_t)h * head_dim;
+                float a = xh[i], b = xh[i + half];
+                xh[i] = a * c - b * s;
+                xh[i + half] = b * c + a * s;
+            }
+        }
+    }
+}
+
 void trv_rope(float *x, uint32_t T, uint32_t n_heads, uint32_t head_dim,
               uint32_t ldx, uint32_t pos0, float base)
 {
@@ -220,28 +165,38 @@ void trv_rope(float *x, uint32_t T, uint32_t n_heads, uint32_t head_dim,
     }
 }
 
-void trv_attention_head(const float *q, const float *k, const float *v,
-                        uint32_t ld, uint32_t T, uint32_t d,
-                        int32_t half_window, const uint8_t *key_mask,
-                        float *out, uint32_t ldo)
+void trv_attention_head_pos(const float *q, const float *k, const float *v,
+                            uint32_t ld, uint32_t T, uint32_t d,
+                            int32_t half_window, const uint8_t *key_mask,
+                            const uint32_t *pos, float *out, uint32_t ldo)
 {
     const float scale = 1.0f / sqrtf((float)d);
-    uint32_t i, j, c;
+    uint32_t i, j, c, j0 = 0, j1 = 0;
 
     for (i = 0; i < T; ++i) {
         const float *qi = q + (size_t)i * ld;
         float *acc = out + (size_t)i * ldo;
         float mx = -INFINITY, l = 0.0f;
-        uint32_t j0 = 0, j1 = T;
+        uint32_t lo = 0, hi = T;
 
         if (half_window >= 0) {
             uint32_t hw = (uint32_t)half_window;
-            j0 = (i > hw) ? i - hw : 0u;
-            j1 = (i + hw + 1u < T) ? i + hw + 1u : T;
+            if (!pos) {
+                lo = (i > hw) ? i - hw : 0u;
+                hi = (i + hw + 1u < T) ? i + hw + 1u : T;
+            } else {
+                /* positions increase, so the window slides forward with i */
+                uint32_t p = pos[i], plo = p > hw ? p - hw : 0u;
+                while (j0 < T && pos[j0] < plo) ++j0;
+                if (j1 < j0) j1 = j0;
+                while (j1 < T && pos[j1] <= p + hw) ++j1;
+                lo = j0;
+                hi = j1;
+            }
         }
         for (c = 0; c < d; ++c) acc[c] = 0.0f;
 
-        for (j = j0; j < j1; ++j) {
+        for (j = lo; j < hi; ++j) {
             const float *kj, *vj;
             float s = 0.0f, p;
             if (key_mask && !key_mask[j]) continue;
@@ -264,4 +219,12 @@ void trv_attention_head(const float *q, const float *k, const float *v,
             for (c = 0; c < d; ++c) acc[c] *= inv;
         }
     }
+}
+
+void trv_attention_head(const float *q, const float *k, const float *v,
+                        uint32_t ld, uint32_t T, uint32_t d,
+                        int32_t half_window, const uint8_t *key_mask,
+                        float *out, uint32_t ldo)
+{
+    trv_attention_head_pos(q, k, v, ld, T, d, half_window, key_mask, NULL, out, ldo);
 }

@@ -5,6 +5,7 @@
                        u32 dims[ndim] | u32 data_offset | u32 data_nbytes
     DTYPE_F32:         raw float32
     DTYPE_Q8_ROWS:     [N, K]: N float32 row scales, then N*K int8
+    DTYPE_Q4_G32:      [N, K]: per row, K/32 fp16 scales then K/2 packed nibbles
 
 All integers little-endian. Data blocks are 16-byte aligned.
 
@@ -16,12 +17,14 @@ import struct
 
 import numpy as np
 
-from .quantize import quantize_rows_q8
+from .quantize import (dequantize_q4_g32, pack_q4_rows, quantize_q4_g32,
+                       quantize_rows_q8, unpack_q4_rows)
 
 MAGIC = b"TRVK"
 VERSION = 1
 DTYPE_F32 = 0
 DTYPE_Q8_ROWS = 1
+DTYPE_Q4_G32 = 2
 MAX_NAME = 96
 MAX_DIMS = 4
 ALIGN = 16
@@ -41,13 +44,19 @@ def _encode(arr, dtype):
             raise ValueError("Q8_ROWS tensors must be 2-D")
         q, scale = quantize_rows_q8(arr)
         return arr.shape, scale.astype("<f4").tobytes() + q.tobytes()
+    if dtype == DTYPE_Q4_G32:
+        if arr.ndim != 2:
+            raise ValueError("Q4_G32 tensors must be 2-D")
+        q, s16 = quantize_q4_g32(arr)
+        return arr.shape, pack_q4_rows(q, s16)
     raise ValueError(f"unknown dtype {dtype}")
 
 
 def write_trv(path, tensors):
     """Write tensors to a .trv file.
 
-    tensors: iterable of (name, array, dtype) with dtype DTYPE_F32 or DTYPE_Q8_ROWS.
+    tensors: iterable of (name, array, dtype), dtype one of DTYPE_F32,
+    DTYPE_Q8_ROWS, DTYPE_Q4_G32. Data is written in the given order.
     Returns the total file size in bytes.
     """
     items = []
@@ -87,8 +96,9 @@ def write_trv(path, tensors):
 def read_trv(path, dequantize=True):
     """Read a .trv file into {name: (dtype, array)}.
 
-    Q8_ROWS tensors come back de-quantized to float32 unless dequantize=False,
-    in which case the value is (q_int8, scale_f32).
+    Quantized tensors come back de-quantized to float32 unless dequantize=False,
+    in which case the value is (q_int8, scales): float32 per-row scales for
+    Q8_ROWS, float16 [N, K/32] group scales for Q4_G32.
     """
     with open(path, "rb") as f:
         data = f.read()
@@ -118,6 +128,9 @@ def read_trv(path, dequantize=True):
             scale = np.frombuffer(blob[: 4 * N], dtype="<f4").copy()
             q = np.frombuffer(blob[4 * N :], dtype=np.int8).reshape(N, K).copy()
             out[name] = (dtype, q.astype(np.float32) * scale[:, None] if dequantize else (q, scale))
+        elif dtype == DTYPE_Q4_G32:
+            q, s16 = unpack_q4_rows(blob, *shape)
+            out[name] = (dtype, dequantize_q4_g32(q, s16) if dequantize else (q, s16))
         else:
             raise ValueError(f"{name}: unknown dtype {dtype}")
     return out
