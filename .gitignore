@@ -1,0 +1,7 @@
+build/
+*.o
+*.trv
+*.bin
+__pycache__/
+*.egg-info/
+.venv/

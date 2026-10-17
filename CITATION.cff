@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use Trivikrama, please cite it as below."
+title: "Trivikrama: streaming full-size transformer encoders on microcontrollers"
+abstract: >-
+  An open-source C library and converter that runs pretrained transformer
+  encoders on microcontrollers by streaming int8 weights from external storage
+  one tile at a time, so each weight is read once per inference.
+authors:
+  - family-names: "Sai Charan"
+    given-names: "Vadhyar"
+type: software
+license: Apache-2.0
+version: "0.1.0"
+date-released: "2026-10-17"
+repository-code: "https://github.com/<your-github-username>/trivikrama"
+keywords:
+  - tinyml
+  - microcontroller
+  - transformer
+  - bert
+  - out-of-core inference
+  - esp32
+  - rp2040

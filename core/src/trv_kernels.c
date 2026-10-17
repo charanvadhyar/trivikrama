@@ -1,0 +1,194 @@
+/*
+ * Trivikrama kernels.
+ * Copyright 2026 Vadhyar Sai Charan
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#include "trivikrama.h"
+
+#include <math.h>
+#include <string.h>
+
+void trv_quantize_act_q8(const float *x, uint32_t T, uint32_t K, uint32_t ldx,
+                         int8_t *xq, float *xscale)
+{
+    uint32_t t, k;
+    for (t = 0; t < T; ++t) {
+        const float *row = x + (size_t)t * ldx;
+        int8_t *qrow = xq + (size_t)t * K;
+        float maxabs = 0.0f, s;
+        for (k = 0; k < K; ++k) {
+            float a = fabsf(row[k]);
+            if (a > maxabs) maxabs = a;
+        }
+        s = (maxabs > 0.0f) ? maxabs / 127.0f : 1.0f;
+        xscale[t] = s;
+        for (k = 0; k < K; ++k) {
+            long q = lrintf(row[k] / s);
+            if (q > 127) q = 127;
+            if (q < -127) q = -127;
+            qrow[k] = (int8_t)q;
+        }
+    }
+}
+
+trv_status trv_linear_q8_stream(const trv_model *m, const trv_tensor *w,
+                                const int8_t *xq, const float *xscale, uint32_t T,
+                                const float *bias, uint32_t n_begin, uint32_t n_end,
+                                float *y, uint32_t ldy,
+                                void *tile_buf, uint32_t tile_bytes)
+{
+    uint32_t N, K, rows_per_tile, n0;
+    uint8_t *buf = (uint8_t *)tile_buf;
+
+    if (!m || !w || !xq || !xscale || !y || !tile_buf) return TRV_ERR_ARG;
+    if (w->dtype != TRV_DTYPE_Q8_ROWS || w->ndim != 2) return TRV_ERR_ARG;
+    N = w->dims[0];
+    K = w->dims[1];
+    if (n_begin > n_end || n_end > N || K == 0) return TRV_ERR_ARG;
+
+    rows_per_tile = tile_bytes / (K + 4u);
+    if (rows_per_tile == 0) return TRV_ERR_BUFFER;
+
+    for (n0 = n_begin; n0 < n_end; n0 += rows_per_tile) {
+        uint32_t r = n_end - n0;
+        uint32_t i;
+        const int8_t *rows;
+        if (r > rows_per_tile) r = rows_per_tile;
+
+        /* stride 1 of the three: bring one tile (scales + int8 rows) into RAM */
+        if (m->src->read(m->src->ctx, w->offset + 4u * n0, buf, 4u * r) != 0)
+            return TRV_ERR_IO;
+        if (m->src->read(m->src->ctx, w->offset + 4u * N + n0 * K,
+                         buf + 4u * r, r * K) != 0)
+            return TRV_ERR_IO;
+        rows = (const int8_t *)(buf + 4u * r);
+
+        /* apply the tile to every token before moving on */
+        for (i = 0; i < r; ++i) {
+            const int8_t *wr = rows + (size_t)i * K;
+            uint32_t n = n0 + i, t;
+            float ws, b = bias ? bias[n] : 0.0f;
+            memcpy(&ws, buf + 4u * i, 4); /* unaligned-safe */
+            for (t = 0; t < T; ++t) {
+                const int8_t *xr = xq + (size_t)t * K;
+                int32_t acc = 0;
+                uint32_t k;
+                for (k = 0; k < K; ++k) acc += (int32_t)xr[k] * (int32_t)wr[k];
+                y[(size_t)t * ldy + (n - n_begin)] = (float)acc * xscale[t] * ws + b;
+            }
+        }
+    }
+    return TRV_OK;
+}
+
+void trv_layernorm(float *x, uint32_t T, uint32_t D, uint32_t ldx,
+                   const float *gamma, const float *beta, float eps)
+{
+    uint32_t t, i;
+    for (t = 0; t < T; ++t) {
+        float *row = x + (size_t)t * ldx;
+        float mean = 0.0f, var = 0.0f, inv;
+        for (i = 0; i < D; ++i) mean += row[i];
+        mean /= (float)D;
+        for (i = 0; i < D; ++i) {
+            float d = row[i] - mean;
+            var += d * d;
+        }
+        var /= (float)D;
+        inv = 1.0f / sqrtf(var + eps);
+        for (i = 0; i < D; ++i) {
+            float v = (row[i] - mean) * inv * gamma[i];
+            row[i] = beta ? v + beta[i] : v;
+        }
+    }
+}
+
+static float gelu1(float v)
+{
+    return 0.5f * v * (1.0f + erff(v * 0.70710678118654752f));
+}
+
+void trv_gelu(float *x, uint32_t n)
+{
+    uint32_t i;
+    for (i = 0; i < n; ++i) x[i] = gelu1(x[i]);
+}
+
+void trv_geglu(const float *in, uint32_t T, uint32_t I, uint32_t ldin,
+               float *out, uint32_t ldout)
+{
+    uint32_t t, i;
+    for (t = 0; t < T; ++t) {
+        const float *a = in + (size_t)t * ldin;
+        float *o = out + (size_t)t * ldout;
+        for (i = 0; i < I; ++i) {
+            float gate = a[I + i];
+            o[i] = gelu1(a[i]) * gate;
+        }
+    }
+}
+
+void trv_rope(float *x, uint32_t T, uint32_t n_heads, uint32_t head_dim,
+              uint32_t ldx, uint32_t pos0, float base)
+{
+    uint32_t half = head_dim / 2u, i, t, h;
+    for (i = 0; i < half; ++i) {
+        float inv_freq = powf(base, -2.0f * (float)i / (float)head_dim);
+        for (t = 0; t < T; ++t) {
+            float ang = (float)(pos0 + t) * inv_freq;
+            float c = cosf(ang), s = sinf(ang);
+            for (h = 0; h < n_heads; ++h) {
+                float *xh = x + (size_t)t * ldx + (size_t)h * head_dim;
+                float a = xh[i], b = xh[i + half];
+                xh[i] = a * c - b * s;
+                xh[i + half] = b * c + a * s;
+            }
+        }
+    }
+}
+
+void trv_attention_head(const float *q, const float *k, const float *v,
+                        uint32_t ld, uint32_t T, uint32_t d,
+                        int32_t half_window, const uint8_t *key_mask,
+                        float *out, uint32_t ldo)
+{
+    const float scale = 1.0f / sqrtf((float)d);
+    uint32_t i, j, c;
+
+    for (i = 0; i < T; ++i) {
+        const float *qi = q + (size_t)i * ld;
+        float *acc = out + (size_t)i * ldo;
+        float mx = -INFINITY, l = 0.0f;
+        uint32_t j0 = 0, j1 = T;
+
+        if (half_window >= 0) {
+            uint32_t hw = (uint32_t)half_window;
+            j0 = (i > hw) ? i - hw : 0u;
+            j1 = (i + hw + 1u < T) ? i + hw + 1u : T;
+        }
+        for (c = 0; c < d; ++c) acc[c] = 0.0f;
+
+        for (j = j0; j < j1; ++j) {
+            const float *kj, *vj;
+            float s = 0.0f, p;
+            if (key_mask && !key_mask[j]) continue;
+            kj = k + (size_t)j * ld;
+            vj = v + (size_t)j * ld;
+            for (c = 0; c < d; ++c) s += qi[c] * kj[c];
+            s *= scale;
+            if (s > mx) { /* new running max: rescale what we have so far */
+                float corr = expf(mx - s); /* exp(-inf) == 0 on the first key */
+                l *= corr;
+                for (c = 0; c < d; ++c) acc[c] *= corr;
+                mx = s;
+            }
+            p = expf(s - mx);
+            l += p;
+            for (c = 0; c < d; ++c) acc[c] += p * vj[c];
+        }
+        if (l > 0.0f) {
+            float inv = 1.0f / l;
+            for (c = 0; c < d; ++c) acc[c] *= inv;
+        }
+    }
+}
