@@ -130,8 +130,12 @@ Type at the `laya>` prompt and press Enter. One dot appears per encoder layer
 ## The banner
 
 At start the CLI shows Trivikrama with his foot on Bali's head, revealed line
-by line, then types out the name. Terminals 120 columns or wider get the
-full-size picture; narrower ones and serial monitors get a 60-column version.
+by line, then types out the name. On a board it is the full 120 x 73 picture:
+widen the serial monitor window (PuTTY, Tera Term, `idf.py monitor`,
+`screen`). Build with `-DLAYA_COLUMNS=80` for a 60-column version. On a PC the
+width is detected: terminals narrower than 120 columns get the small one.
+The Arduino IDE serial monitor does not understand colour codes; use
+`-DLAYA_BANNER=0` there.
 Build with `-DLAYA_BANNER=2` for a small animation of the story instead
 (Vamana asks Bali for three steps, grows, takes the third step), or
 `-DLAYA_BANNER=0` for none. When the output is a pipe or a log, it prints one

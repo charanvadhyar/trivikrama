@@ -43,8 +43,9 @@
 #ifndef LAYA_BANNER /* 0: none, 1: Trivikrama picture, 2: Vamana story animation */
 #define LAYA_BANNER 1
 #endif
-#ifndef LAYA_COLUMNS /* serial monitors: assume 80 columns (the 60-column picture) */
-#define LAYA_COLUMNS 80
+#ifndef LAYA_COLUMNS /* boards can't ask the monitor its width: show the full 120-column
+                        picture (widen the window); -DLAYA_COLUMNS=80 for the small one */
+#define LAYA_COLUMNS 120
 #endif
 #ifndef LAYA_TILE_BYTES
 #define LAYA_TILE_BYTES (64u * 1024u)
