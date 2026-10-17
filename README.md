@@ -41,7 +41,7 @@ if you are willing to wait.
 | Virtual-MCU runner (RAM limits, bytes streamed, MACs) | ✅ |
 | Speed features: int4, mixed precision, multi-core, async prefetch, storage tiers, batching, early exit, token pruning, SIMD hook | ✅ bit-exact against the plain path (`make test-features`) |
 | CI (GitHub Actions) | ✅ |
-| Laya decision head in C (whole decision on the device) | ✅ verified against NumPy (`make test-laya`) |
+| Laya decision head in C (whole decision on the device) | ✅ verified against NumPy (`make test-laya`) and against PyTorch Laya (`--full-c`) |
 | Laya end to end: export, prepare, run, decode (`trivi laya-ask`) | ✅ |
 | Ports: ESP32-S3, RP2040 / RP2350 | 🚧 |
 | ESP8266 (needs a smaller residual stream, e.g. fp16) | 🚧 |
@@ -125,15 +125,25 @@ What this means for Laya:
 
 ### Laya's decisions on Trivikrama
 
-`tools/laya_decisions.py` runs the official `laya` package with only its
-encoder swapped for Trivikrama and compares every answer with the released
-PyTorch model. First run (5 inputs, guard questions):
+`tools/laya_decisions.py` runs the official `laya` package and compares every
+answer with the released PyTorch model: either with only the encoder swapped
+for Trivikrama, or with `--full-c`, where the whole decision (encoder + decision
+head) runs in C exactly as on a device and only tokenizing stays in Python.
 
-| | int8 |
-|---|---|
-| Yes/no answers | 15/15 identical (largest yes-probability difference 0.05) |
-| Choice answers | 4/5 (the one flip was a near-tie at 0.30 top probability) |
-| Score answers | all within 0.05 |
+30 inputs x 10 questions (guard + moderation presets), encoder in C:
+
+| | int8 | auto (7 matrices int4) |
+|---|---|---|
+| Yes/no answers | 209/210 same | 208/210 same |
+| Choice answers | 27/30 (all 3 flips on questions PyTorch itself was unsure about, top p < 0.5) | 29/30 |
+| Score answers within ±0.1 | 58/60 (mean diff 0.031) | 46/60 (mean diff 0.076, max 0.46) |
+
+Whole decision in C (`--full-c`, `trivi export-laya`, int8), 10 inputs x guard:
+**30/30 yes/no, 9/10 choice (one low-confidence flip), 10/10 scores**, the same
+as with only the encoder in C: the C decision head adds no visible error.
+
+**Use int8 for Laya.** The calibrated int4 mix keeps yes/no answers but moves
+the severity scores; it saves ~7% of the bytes, not worth it here.
 
 ```bash
 pip install laya
