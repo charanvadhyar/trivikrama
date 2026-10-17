@@ -43,9 +43,12 @@
 #ifndef LAYA_BANNER /* 0: none, 1: Trivikrama picture, 2: Vamana story animation */
 #define LAYA_BANNER 1
 #endif
-#ifndef LAYA_COLUMNS /* boards can't ask the monitor its width: show the full 120-column
-                        picture (widen the window); -DLAYA_COLUMNS=80 for the small one */
+#ifndef LAYA_COLUMNS /* boards can't ask the monitor its width: show the full picture
+                        (widen the window); -DLAYA_COLUMNS=80 for the small one */
 #define LAYA_COLUMNS 120
+#endif
+#ifndef LAYA_COLOR256 /* boards: assume the monitor shows 256 colours (PuTTY, idf.py monitor) */
+#define LAYA_COLOR256 1
 #endif
 #ifndef LAYA_TILE_BYTES
 #define LAYA_TILE_BYTES (64u * 1024u)
@@ -173,6 +176,17 @@ static int terminal_columns(void)
     return LAYA_COLUMNS;
 }
 
+static int color256(void)
+{
+#if defined(__unix__) || defined(__APPLE__) || defined(_WIN32)
+    const char *t = getenv("TERM");
+    return getenv("COLORTERM") || getenv("WT_SESSION") || getenv("TERM_PROGRAM") ||
+           (t && strstr(t, "256"));
+#else
+    return LAYA_COLOR256;
+#endif
+}
+
 static int interactive(void)
 {
 #if defined(__unix__) || defined(__APPLE__)
@@ -212,7 +226,7 @@ int laya_cli_main(const char *model_path, const char *questions_path)
         free(qbuf);
         return 1;
     }
-    if (LAYA_BANNER) trivi_banner(LAYA_BANNER, interactive(), terminal_columns());
+    if (LAYA_BANNER) trivi_banner(LAYA_BANNER, interactive(), terminal_columns(), color256());
     printf("Laya on Trivikrama: %u questions:", (unsigned)lt.n_questions);
     for (i = 0; i < lt.n_questions; ++i)
         printf(" %.*s", (int)lt.questions[i].name_len, lt.questions[i].name);

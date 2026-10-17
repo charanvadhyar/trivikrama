@@ -320,6 +320,7 @@ tools/trv_laya.c            answer a Laya request on the PC with the device code
 examples/laya_device/       complete Laya program for a board (or the PC), prepared requests
 examples/laya_cli/          `laya>` prompt: type text, get answers (ESP-IDF guide inside)
 tools/trv_tokenize.c        run the device tokenizer on the PC (tests)
+tools/image_to_banner.py    turn a picture into a terminal banner (half-blocks, Braille, ASCII)
 tools/check_laya_text.py    device tokenizer + rows vs the real `laya` package
 tools/virtual_mcu.py        per-board RAM fit and time estimates
 tools/benchmark.py          measure every speed feature on a model

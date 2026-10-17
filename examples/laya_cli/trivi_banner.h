@@ -1,9 +1,9 @@
 /*
  * The Trivikrama banner, plain ASCII + ANSI escape codes, so it plays in any
  * terminal and in a serial monitor (idf.py monitor, PuTTY, minicom...):
- *   picture  Trivikrama with his foot on Bali's head (120 columns, or a
- *            60-column version for narrow terminals and serial monitors),
- *            revealed line by line, then the name typed out
+ *   picture  Trivikrama with his foot on Bali's head, revealed line by line,
+ *            then the name typed out: in green half-blocks on terminals with
+ *            256 colours (100 or 60 columns), else the 120-column ASCII picture
  *   story    small animation: Vamana asks Bali for three steps of land,
  *            grows into Trivikrama, and takes the third step
  *
@@ -14,6 +14,8 @@
 #define TRIVI_BANNER_H
 
 #include <stdio.h>
+
+#include "trivi_picture.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -105,44 +107,6 @@ static const char *const trivi_picture_wide[73] = {
     "-------:::::::::::-----:::::---:::..:...:::::......::..............:::::::::.::::-===-.......:::::::::::::::::::::.:::::"
 };
 
-static const char *const trivi_picture_narrow[36] = {
-    "                 .",
-    "                    .",
-    "              .-.- ...",
-    "           :...... :.   +#@%=",
-    "           ... .:.    .=- #+#",
-    "          :  .  :.    .*%=**",
-    "                       .=+=",
-    "                      =::*- :",
-    "                -+* : #%%@::@@@%",
-    "              .+###:* :*=#-%@+%@@",
-    "             .+%%@@%++ %#*#@+:+%:         :",
-    "             +#+#@@-:+=@**@@#  =%@      @@%*",
-    "            #%@%:#:  #=**@@@@  :*@@@@@+:=@#",
-    "           =@%*+. :+ #@%@@@@@%   .:----: .",
-    "            .    .+*#@@@@@@%*%*: .",
-    "                 .=*+%@@@%@#*@@#####+:.             .",
-    "                -=+**#%=*%#+-*+#%%%%*++*#+.          .",
-    "         ..... .-=+@@@%*=%@===+##*#+**@@#@%-.:",
-    ".    ..... ..:..:*#%@@*=*%%%:=+**++*%=+%@@@@*       ..",
-    ".   .. .... .:..:=+#%*++*%@@=:-==++++-+*#%@@=:..:..:.:..",
-    ".  . ....:...:...:+***#+@%@#%-==-+:-:-%@@@@@--==-:..:--.:.-:",
-    "..   .............-=+***@#@#%+--=:--==%@@@@:::----::::.  ..",
-    ".........    . ...--=====:+:.:-:::.---%@@@:.::--:--:::-:..",
-    ".......           .:*@@@-=....:...  .+%@@=.::-:::::... ...",
-    "                    -=@#@*   .      -#%@@*-..:... .",
-    "                    +%@@@=           :*@@@@-",
-    "                    :#@@@               %@%.",
-    "                     +%@+           .#+  :",
-    "                    .+=#= :        .:=+*++",
-    "..::::---------===--:*+##--=--:::...:  *+=",
-    " ......   .          -%@@%=:.       ....-#+-+.",
-    "..........   .  ...  .#@@@+:.   =+.-..-+#%+**=",
-    "          ..           .         =+%*- # -.-+",
-    "                                  =+%+ -: *@-",
-    "                                    .-**:*==",
-    "                                       -+*="
-};
 
 #define TRIVI_ART_ROWS 15
 #define TRIVI_FRAMES 5
@@ -276,24 +240,41 @@ static void trivi_story(int animate)
     fflush(stdout);
 }
 
-static void trivi_picture(int animate, int columns)
+static void trivi_picture(int animate, int columns, int color256)
 {
     static const char title[] = "T R I V I K R A M A";
     static const char motto[] = "a tiny chip, a giant model";
-    const char *const *pic = columns >= 120 ? trivi_picture_wide : trivi_picture_narrow;
-    int rows = columns >= 120 ? (int)(sizeof trivi_picture_wide / sizeof *pic)
-                              : (int)(sizeof trivi_picture_narrow / sizeof *pic);
-    int width = columns >= 120 ? 120 : 60, pad, r;
+    const char *const *pic;
+    int rows, width, pad, r, delay;
     const char *c;
-    if (!animate) {
+    if (color256 && columns >= 100) {
+        pic = trivi_blocks_wide;
+        rows = (int)(sizeof trivi_blocks_wide / sizeof *pic);
+        width = 100;
+    } else if (color256 && columns >= 60) {
+        pic = trivi_blocks_narrow;
+        rows = (int)(sizeof trivi_blocks_narrow / sizeof *pic);
+        width = 60;
+    } else if (columns >= 120) {
+        pic = trivi_picture_wide;
+        rows = (int)(sizeof trivi_picture_wide / sizeof *pic);
+        width = 120;
+    } else {
+        pic = NULL;
+        rows = 0;
+        width = 60;
+    }
+    if (!animate || !pic) {
         printf("%s   %s\n", title, motto);
         return;
     }
+    delay = 900 / rows; /* the whole reveal takes about a second */
     printf("\033[?25l");
     for (r = 0; r < rows; ++r) { /* reveal top to bottom */
-        printf(TRIVI_GREEN "\033[1m%s" TRIVI_RESET "\n", pic[r]);
+        if (pic == trivi_picture_wide) printf(TRIVI_GREEN "\033[1m%s" TRIVI_RESET "\n", pic[r]);
+        else printf("%s\n", pic[r]);
         fflush(stdout);
-        trivi_sleep_ms(columns >= 120 ? 12 : 25);
+        trivi_sleep_ms((unsigned)delay);
     }
     pad = (width - (int)(sizeof title - 1)) / 2;
     printf("\n%*s" TRIVI_SAFFRON TRIVI_BOLD, pad, "");
@@ -309,14 +290,15 @@ static void trivi_picture(int animate, int columns)
 }
 
 /*
- * style    1: the picture, 2: the story animation
- * animate  0 prints one plain line instead (logs, pipes, tests)
- * columns  terminal width; 120 or more shows the full-size picture
+ * style     1: the picture, 2: the story animation
+ * animate   0 prints one plain line instead (logs, pipes, tests)
+ * columns   terminal width
+ * color256  the terminal shows 256 colours (half-block picture)
  */
-static void trivi_banner(int style, int animate, int columns)
+static void trivi_banner(int style, int animate, int columns, int color256)
 {
     if (style == 2) trivi_story(animate);
-    else trivi_picture(animate, columns);
+    else trivi_picture(animate, columns, color256);
 }
 
 #endif /* TRIVI_BANNER_H */

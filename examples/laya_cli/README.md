@@ -130,16 +130,25 @@ Type at the `laya>` prompt and press Enter. One dot appears per encoder layer
 ## The banner
 
 At start the CLI shows Trivikrama with his foot on Bali's head, revealed line
-by line, then types out the name. On a board it is the full 120 x 73 picture:
-widen the serial monitor window (PuTTY, Tera Term, `idf.py monitor`,
-`screen`). Build with `-DLAYA_COLUMNS=80` for a 60-column version. On a PC the
-width is detected: terminals narrower than 120 columns get the small one.
-The Arduino IDE serial monitor does not understand colour codes; use
-`-DLAYA_BANNER=0` there.
-Build with `-DLAYA_BANNER=2` for a small animation of the story instead
-(Vamana asks Bali for three steps, grows, takes the third step), or
-`-DLAYA_BANNER=0` for none. When the output is a pipe or a log, it prints one
-plain line instead.
+by line, then types out the name.
+
+- Terminals with 256 colours (Windows Terminal, VS Code, PuTTY, Tera Term,
+  `idf.py monitor`, Linux/Mac terminals): the picture in **green half-blocks**,
+  two pixels per character, 100 columns wide (60 if the window is narrower).
+- Other terminals: the 120-column ASCII picture.
+- Arduino IDE serial monitor: it can't show colour codes, so build with
+  `-DLAYA_BANNER=0`.
+
+On a board, widen the monitor window to 100+ columns. The picture is about
+100 KB of text: instant over the ESP32-S3's USB port, about 9 s over a
+115200-baud UART (`-DLAYA_COLUMNS=80` sends the 60-column one, about 3 s).
+`-DLAYA_BANNER=2` plays a small animation of the story instead.
+
+Make your own from any picture:
+
+```bash
+python tools/image_to_banner.py photo.jpg --style blocks --tint green --cols 100 --preview
+```
 
 ## On a PC
 
