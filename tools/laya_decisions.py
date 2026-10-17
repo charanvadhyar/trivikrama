@@ -9,6 +9,10 @@ calibration all stay Laya's own, so every difference comes from Trivikrama.
     python tools/laya_decisions.py --laya ./laya --models laya8.trv \\
         --inputs my_inputs.txt --questions guard,moderation
 
+With --full-c the whole decision (encoder AND decision head) runs in C
+(build/trv_laya on a .trv from `trivi export-laya`); only tokenizing stays
+Laya's Python. That is exactly what a device does.
+
 Reports agreement per question type:
   noul (yes/no)  same answer (p_yes > 0.5)
   choice         same label; flips on low-confidence questions are counted apart
@@ -146,6 +150,9 @@ def main():
     p.add_argument("--low-conf", type=float, default=0.5,
                    help="a choice whose top probability is below this counts as low-confidence")
     p.add_argument("--binary", default="build/trv_run")
+    p.add_argument("--full-c", action="store_true",
+                   help="run encoder + decision head in C (models from `trivi export-laya`)")
+    p.add_argument("--laya-binary", default="build/trv_laya")
     p.add_argument("--threads", type=int, default=2)
     p.add_argument("--out", default="laya_decisions.json", help="detailed results (JSON)")
     a = p.parse_args()
@@ -162,13 +169,26 @@ def main():
     models = [m.strip() for m in a.models.split(",") if m.strip()]
     print(f"{len(inputs)} inputs x {len(questions)} questions; models: {', '.join(models)}")
 
+    prep = None
+    if a.full_c:
+        from trivikrama.laya import Preparer, decode, run_device
+
+        prep = Preparer(agent=agent)
+
+    def ask(s, path):
+        if path is None or not a.full_c:
+            return answers_of(agent.predict(s, questions))
+        rows, meta = prep.rows(s, questions)
+        probs, _ = run_device(a.laya_binary, path, rows, threads=a.threads)
+        return decode(probs, meta)
+
     runs = {}
     for label, path in [("pytorch", None)] + [(m, m) for m in models]:
-        agent.model.encoder = real if path is None else Enc(path)
+        agent.model.encoder = real if (path is None or a.full_c) else Enc(path)
         t = time.time()
         runs[label] = []
         for i, s in enumerate(inputs):
-            ans = answers_of(agent.predict(s, questions))
+            ans = ask(s, path)
             runs[label].append({q: summarize(ans[q]) for q in questions if q in ans})
             print(f"\r  {label}: {i + 1}/{len(inputs)}", end="", flush=True)
         print(f"\r  {label}: {time.time() - t:.0f} s ({(time.time() - t) / len(inputs):.1f} s per input)")

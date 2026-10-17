@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trivikrama"
-version = "0.3.1"
+version = "0.4.0"
 description = "Run full-size transformer encoders on microcontrollers by streaming weights from an SD card."
 readme = "README.md"
 license = { text = "Apache-2.0" }
