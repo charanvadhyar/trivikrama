@@ -122,6 +122,24 @@ What this means for Laya:
   very different representation. It would need a head trained on an
   intermediate layer. The early-exit hook stays useful for models built for it.
 
+### Laya's decisions on Trivikrama
+
+`tools/laya_decisions.py` runs the official `laya` package with only its
+encoder swapped for Trivikrama and compares every answer with the released
+PyTorch model. First run (5 inputs, guard questions):
+
+| | int8 |
+|---|---|
+| Yes/no answers | 15/15 identical (largest yes-probability difference 0.05) |
+| Choice answers | 4/5 (the one flip was a near-tie at 0.30 top probability) |
+| Score answers | all within 0.05 |
+
+```bash
+pip install laya
+python tools/laya_decisions.py --laya ./laya --models laya8.trv \
+    --inputs my_inputs.txt --questions guard,moderation
+```
+
 | Feature | What it does | How to use |
 |---|---|---|
 | int4 weights | 4-bit, groups of 32, fp16 scales (error-minimizing scale search): ~45% fewer bytes | `trivi export-modernbert --weights int4` |
@@ -179,6 +197,7 @@ python/trivikrama/          converter, ModernBERT exporter, NumPy reference, `tr
 tools/trv_run.c             run a model on the PC as a "virtual MCU" (RAM budget, stats)
 tools/virtual_mcu.py        per-board RAM fit and time estimates
 tools/benchmark.py          measure every speed feature on a model
+tools/laya_decisions.py     compare Laya's answers: PyTorch vs Trivikrama encoder
 tests/                      C vs NumPy, features vs plain path, exporter, C vs Hugging Face
 ```
 
