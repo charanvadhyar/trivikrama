@@ -92,8 +92,11 @@ microcontroller's SD card (`tools/benchmark.py`):
 | ... + batch of 4 sequences (time per sequence) | 1.58 s | 48 MB | 5.2× |
 | ... or early exit after 14 of 28 layers | 1.28 s | 97 MB | 6.4× |
 
-Early exit and int4 change the model's output (by design); check the accuracy
-cost on your own model before relying on them. Everything else is exact.
+Early exit and int4 change the model's output; on the real Laya encoder
+they cost too much accuracy (see below), so the useful rows for Laya are the
+exact ones: async, multi-core, flash tier and batching. Measured on Laya
+itself (int8, 8 tokens, simulated 100 MB/s card): 9.03 s plain, 7.14 s with
+async + 2 cores, about 1.6 s per sequence in a batch of 4.
 
 ### Accuracy on the real Laya encoder
 
@@ -103,13 +106,21 @@ token by token with Hugging Face's float32 ModernBERT on real sentences:
 | Weights | Mean token cosine vs. float32 | Worst token |
 |---|---|---|
 | int8 | 0.994 – 0.999 | 0.98 |
+| `--weights auto` (7 of 112 matrices int4, file 386 MB vs 396 MB) | 0.989 – 0.996 | 0.97 |
 | int4 everywhere | 0.94 – 0.97 | 0.87 |
+| int8, early exit after layer 14 of 28 | 0.51 – 0.62 | 0.06 |
 
-int8 is the recommended default. Plain group-wise int4 is too coarse for most
-of a transformer encoder; `--weights auto` measures, per matrix, how much int4
-costs on real inputs and only uses it where the output stays above the target.
-`--max-drop` sets how much output similarity int4 may cost relative to int8. Better int4 methods (activation-aware scaling, GPTQ-style rounding)
-are future work.
+What this means for Laya:
+
+- **int8 is the right choice.** It is accurate, and the exact speed features
+  (async prefetch, multi-core, storage tiers, batching) all apply to it.
+- **int4 buys almost nothing here.** Only a handful of matrices tolerate it,
+  saving about 3% of the file. Plain group-wise int4 is too coarse for this
+  encoder; better int4 methods (activation-aware scaling, GPTQ-style
+  rounding) are future work.
+- **Early exit is not usable on Laya as released**: half the layers gives a
+  very different representation. It would need a head trained on an
+  intermediate layer. The early-exit hook stays useful for models built for it.
 
 | Feature | What it does | How to use |
 |---|---|---|
