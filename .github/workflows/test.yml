@@ -13,11 +13,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install numpy safetensors
+      - run: pip install numpy safetensors tokenizers
       - run: make test-kernels
       - run: make test-features
       - run: make test-export
       - run: make test-laya
+      - run: make test-tokenizer
 
   huggingface:
     name: ModernBERT vs Hugging Face

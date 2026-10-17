@@ -7,6 +7,7 @@
     trivi export-laya ./laya -o laya8.trv                  Laya: encoder + decision head
     trivi laya-prepare --laya ./laya --text "..." --questions guard -o req.trq
     trivi laya-ask --laya ./laya --model laya8.trv --text "..." --questions guard
+    trivi laya-questions --laya ./laya --questions guard -o guard.tlq   for typing on the device
 
 Copyright 2026 Vadhyar Sai Charan
 SPDX-License-Identifier: Apache-2.0
@@ -236,6 +237,24 @@ def cmd_laya_ask(args):
           f"{stats['ram_bytes'] / 1e6:.1f} MB RAM", file=sys.stderr)
 
 
+def cmd_laya_questions(args):
+    import laya
+
+    from .laya_text import agent_tokenizer, laya_questions, write_tlq
+
+    args.text, args.text_file, args.state_json = "", None, None
+    _, questions = _laya_inputs(args)
+    agent = laya.load(args.laya, device="cpu")
+    print("reading Laya's tokenizer and measuring its Unicode classes (about 10 s)...")
+    tables = agent_tokenizer(agent)
+    qs, sep_id, mask = laya_questions(agent, questions)
+    size = write_tlq(args.output, tables, qs, sep_id, mask)
+    rooms = [q[4] for q in qs]
+    print(f"wrote {args.output}: {size / 1024:.0f} KB, {len(qs)} questions "
+          f"({', '.join(q[0] for q in qs)}), {len(tables['merges'])} merges; "
+          f"{min(rooms)}-{max(rooms)} text tokens fit per question")
+
+
 def cmd_inspect(args):
     tensors = read_trv(args.input, dequantize=False)
     total = 0
@@ -332,6 +351,14 @@ def main(argv=None):
     ak.add_argument("--binary", default=None, help="trv_laya program (default: build/trv_laya)")
     ak.add_argument("--threads", type=int, default=2)
     ak.set_defaults(func=cmd_laya_ask)
+
+    lq = sub.add_parser("laya-questions",
+                        help="tokenizer + questions file (.tlq) so the device takes typed text")
+    lq.add_argument("--laya", default="./laya", help="Laya folder")
+    lq.add_argument("--questions", default="guard",
+                    help="laya presets (comma-separated) or a questions .json file")
+    lq.add_argument("-o", "--output", default="questions.tlq")
+    lq.set_defaults(func=cmd_laya_questions)
 
     i = sub.add_parser("inspect", help="list the tensors in a .trv file")
     i.add_argument("input")

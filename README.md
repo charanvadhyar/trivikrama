@@ -40,6 +40,7 @@ A board with ~100 KB of free RAM can compute a 400M-parameter model, exactly as 
 | CI (GitHub Actions) | ✅ |
 | Laya decision head in C (whole decision on the device) | ✅ verified against NumPy (`make test-laya`) and against PyTorch Laya (`--full-c`) |
 | Laya end to end: export, prepare, run, decode (`trivi laya-ask`) | ✅ |
+| Type text on the device: tokenizer in C, `laya>` prompt on the serial monitor | ✅ tokenizer identical to Hugging Face `tokenizers` (`make test-tokenizer`) |
 | Ports: ESP32-S3, RP2040 / RP2350 | 🚧 |
 | ESP8266 (needs a smaller residual stream, e.g. fp16) | 🚧 |
 | Resident mode for small distilled models | 🚧 |
@@ -243,6 +244,30 @@ passes. A board without PSRAM can send its questions one at a time instead
 (less RAM, one full pass each). Boards with PSRAM (ESP32-S3 N8R8 and up,
 ESP32-P4) fit the batched version.
 
+**Typing text straight into the board (no PC after setup):**
+
+```bash
+trivi laya-questions --laya ./laya --questions guard -o guard.tlq   # tokenizer + questions, ~1 MB
+build/laya_cli laya8.trv guard.tlq                                  # try it on the PC first
+```
+
+```
+laya> My card number is 4111 1111 1111 1111 and the CVV is 123.
+............................
+  topic                            ...
+  harm_severity                    ...
+```
+
+The `.tlq` file carries Laya's tokenizer (byte-level BPE with its NFC
+normalization and pre-tokenization, rebuilt in C and checked token for token
+against Hugging Face `tokenizers`) and the questions already formatted the
+way Laya formats them. On the board a typed line becomes, for each question,
+`question + text[:room] + [SEP]`, exactly what `laya.predict` builds for a
+string. Put `laya8.trv` and `guard.tlq` on the SD card and flash
+`examples/laya_cli` (ESP-IDF steps in `examples/laya_cli/README.md`).
+`tools/check_laya_text.py` checks the token ids and input rows against the
+real `laya` package.
+
 **Checking it against Laya itself:**
 
 ```bash
@@ -261,6 +286,7 @@ make test-kernels               # C kernels vs NumPy
 make test-features              # every speed feature is bit-exact vs the plain path
 make test-export                # exporter: nested configs, int4 scale search, calibration
 make test-laya                  # Laya decision head in C vs NumPy
+make test-tokenizer             # device tokenizer vs Hugging Face tokenizers (pip install tokenizers)
 make test-modernbert            # C ModernBERT vs Hugging Face (needs: pip install torch transformers)
 
 # a real model: download a ModernBERT checkpoint folder, then
@@ -287,10 +313,14 @@ core/src/trv_source_file.c  stdio weight source (PC builds and tests)
 core/src/trv_posix.c        PC only: thread pool, async + SD-speed-simulating file source
 core/src/trv_modernbert.c   ModernBERT encoder: batching, early exit, token pruning
 core/src/trv_laya.c         Laya decision head + request parser (whole decision on the device)
+core/src/trv_laya_text.c    Laya's tokenizer in C + question rows from typed text
 python/trivikrama/          converter, ModernBERT + Laya exporters, NumPy reference, `trivi` CLI
 tools/trv_run.c             run a model on the PC as a "virtual MCU" (RAM budget, stats)
 tools/trv_laya.c            answer a Laya request on the PC with the device code
-examples/laya_device/       complete Laya program for a board (or the PC)
+examples/laya_device/       complete Laya program for a board (or the PC), prepared requests
+examples/laya_cli/          `laya>` prompt: type text, get answers (ESP-IDF guide inside)
+tools/trv_tokenize.c        run the device tokenizer on the PC (tests)
+tools/check_laya_text.py    device tokenizer + rows vs the real `laya` package
 tools/virtual_mcu.py        per-board RAM fit and time estimates
 tools/benchmark.py          measure every speed feature on a model
 tools/laya_decisions.py     compare Laya's answers: PyTorch vs Trivikrama (encoder only, or --full-c)
