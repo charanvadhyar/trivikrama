@@ -1,9 +1,10 @@
 /*
  * The Trivikrama banner, plain ASCII + ANSI escape codes, so it plays in any
  * terminal and in a serial monitor (idf.py monitor, PuTTY, minicom...):
- *   picture  Trivikrama with his foot on Bali's head, revealed line by line,
- *            then the name typed out: in green half-blocks on terminals with
- *            256 colours (100 or 60 columns), else the 120-column ASCII picture
+ *   picture  Trivikrama with his foot on Bali's head in green Braille dots
+ *            (100 columns, or 60 in a narrower window), revealed line by
+ *            line, then the name typed out
+ *   ascii    the same picture as the 120-column ASCII art
  *   story    small animation: Vamana asks Bali for three steps of land,
  *            grows into Trivikrama, and takes the third step
  *
@@ -240,25 +241,25 @@ static void trivi_story(int animate)
     fflush(stdout);
 }
 
-static void trivi_picture(int animate, int columns, int color256)
+static void trivi_picture(int animate, int columns, int ascii)
 {
     static const char title[] = "T R I V I K R A M A";
     static const char motto[] = "a tiny chip, a giant model";
     const char *const *pic;
     int rows, width, pad, r, delay;
     const char *c;
-    if (color256 && columns >= 100) {
-        pic = trivi_blocks_wide;
-        rows = (int)(sizeof trivi_blocks_wide / sizeof *pic);
-        width = 100;
-    } else if (color256 && columns >= 60) {
-        pic = trivi_blocks_narrow;
-        rows = (int)(sizeof trivi_blocks_narrow / sizeof *pic);
-        width = 60;
-    } else if (columns >= 120) {
+    if (ascii && columns >= 120) {
         pic = trivi_picture_wide;
         rows = (int)(sizeof trivi_picture_wide / sizeof *pic);
         width = 120;
+    } else if (columns >= 100) {
+        pic = trivi_braille_wide;
+        rows = (int)(sizeof trivi_braille_wide / sizeof *pic);
+        width = 100;
+    } else if (columns >= 60) {
+        pic = trivi_braille_narrow;
+        rows = (int)(sizeof trivi_braille_narrow / sizeof *pic);
+        width = 60;
     } else {
         pic = NULL;
         rows = 0;
@@ -271,8 +272,7 @@ static void trivi_picture(int animate, int columns, int color256)
     delay = 900 / rows; /* the whole reveal takes about a second */
     printf("\033[?25l");
     for (r = 0; r < rows; ++r) { /* reveal top to bottom */
-        if (pic == trivi_picture_wide) printf(TRIVI_GREEN "\033[1m%s" TRIVI_RESET "\n", pic[r]);
-        else printf("%s\n", pic[r]);
+        printf(TRIVI_GREEN "\033[1m%s" TRIVI_RESET "\n", pic[r]);
         fflush(stdout);
         trivi_sleep_ms((unsigned)delay);
     }
@@ -290,15 +290,15 @@ static void trivi_picture(int animate, int columns, int color256)
 }
 
 /*
- * style     1: the picture, 2: the story animation
- * animate   0 prints one plain line instead (logs, pipes, tests)
- * columns   terminal width
- * color256  the terminal shows 256 colours (half-block picture)
+ * style    1: the picture in Braille dots, 2: the story animation,
+ *          3: the picture as ASCII art (terminals without Unicode)
+ * animate  0 prints one plain line instead (logs, pipes, tests)
+ * columns  terminal width
  */
-static void trivi_banner(int style, int animate, int columns, int color256)
+static void trivi_banner(int style, int animate, int columns)
 {
     if (style == 2) trivi_story(animate);
-    else trivi_picture(animate, columns, color256);
+    else trivi_picture(animate, columns, style == 3);
 }
 
 #endif /* TRIVI_BANNER_H */

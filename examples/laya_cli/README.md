@@ -129,25 +129,21 @@ Type at the `laya>` prompt and press Enter. One dot appears per encoder layer
 
 ## The banner
 
-At start the CLI shows Trivikrama with his foot on Bali's head, revealed line
-by line, then types out the name.
+At start the CLI shows Trivikrama with his foot on Bali's head in green
+Braille dots (each character is a 2 x 4 grid of dots), revealed line by line,
+then types out the name. 100 columns wide, or 60 if the window is narrower;
+about 17 KB, so it takes about 1.5 s even over a 115200-baud UART.
 
-- Terminals with 256 colours (Windows Terminal, VS Code, PuTTY, Tera Term,
-  `idf.py monitor`, Linux/Mac terminals): the picture in **green half-blocks**,
-  two pixels per character, 100 columns wide (60 if the window is narrower).
-- Other terminals: the 120-column ASCII picture.
-- Arduino IDE serial monitor: it can't show colour codes, so build with
-  `-DLAYA_BANNER=0`.
-
-On a board, widen the monitor window to 100+ columns. The picture is about
-100 KB of text: instant over the ESP32-S3's USB port, about 9 s over a
-115200-baud UART (`-DLAYA_COLUMNS=80` sends the 60-column one, about 3 s).
-`-DLAYA_BANNER=2` plays a small animation of the story instead.
+- Works in Windows Terminal, VS Code, `idf.py monitor`, Linux/Mac terminals.
+  PuTTY needs a font with Braille (e.g. DejaVu Sans Mono or Cascadia Code).
+- `-DLAYA_BANNER=3`: the 120-column ASCII picture instead (no Unicode needed)
+- `-DLAYA_BANNER=2`: a small animation of the story
+- `-DLAYA_BANNER=0`: no banner (Arduino IDE monitor: it shows colour codes as junk)
 
 Make your own from any picture:
 
 ```bash
-python tools/image_to_banner.py photo.jpg --style blocks --tint green --cols 100 --preview
+python tools/image_to_banner.py photo.jpg --style braille --cols 100 --preview
 ```
 
 ## On a PC
