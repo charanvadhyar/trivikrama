@@ -49,6 +49,8 @@ def hf_reference(seed=0):
         max_position_embeddings=256,
         initializer_range=0.05,
         attn_implementation="eager",
+        pad_token_id=0, bos_token_id=1, eos_token_id=2, cls_token_id=1, sep_token_id=2,
+        tie_last_hidden_states=False,  # transformers 5: keep the pre-final-norm hidden state
     )
     model = ModernBertModel(cfg).eval()
     T = 20
