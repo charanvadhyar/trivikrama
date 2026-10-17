@@ -117,6 +117,10 @@ def main():
             res = subprocess.run([a.cli_binary, a.model, tlq], input="\n".join(inputs) + "\nexit\n",
                                  capture_output=True, text=True)
             blocks = res.stdout.split("laya> ")[1:1 + len(inputs)]
+            if res.returncode or not any("  " in b for b in blocks):
+                print("3. laya_cli did not answer:\n" + (res.stdout + res.stderr)[-600:])
+                print("   (is the .trv from `trivi export-laya`? an encoder-only file has no head)")
+                return 1
             same = total = 0
             for text, block in zip(inputs, blocks):
                 printed = {l.split()[0]: l.split()[1] for l in block.splitlines()

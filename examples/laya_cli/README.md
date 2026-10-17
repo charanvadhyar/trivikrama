@@ -127,6 +127,16 @@ idf.py build flash monitor
 Type at the `laya>` prompt and press Enter. One dot appears per encoder layer
 (28 of them).
 
+## The banner
+
+At start the CLI shows Trivikrama with his foot on Bali's head, revealed line
+by line, then types out the name. Terminals 120 columns or wider get the
+full-size picture; narrower ones and serial monitors get a 60-column version.
+Build with `-DLAYA_BANNER=2` for a small animation of the story instead
+(Vamana asks Bali for three steps, grows, takes the third step), or
+`-DLAYA_BANNER=0` for none. When the output is a pipe or a log, it prints one
+plain line instead.
+
 ## On a PC
 
 The same program runs on the PC, which is the quickest way to check the two files:

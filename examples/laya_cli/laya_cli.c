@@ -19,19 +19,32 @@
  * Copyright 2026 Vadhyar Sai Charan
  * SPDX-License-Identifier: Apache-2.0
  */
+#define _POSIX_C_SOURCE 200112L /* nanosleep, isatty */
+#define _DEFAULT_SOURCE           /* TIOCGWINSZ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
 
 #include "trivikrama_file.h"
 #include "trivikrama_laya_text.h"
+#include "trivi_banner.h"
 
 #ifndef LAYA_LINE_MAX
 #define LAYA_LINE_MAX 2048
 #endif
 #ifndef LAYA_ECHO /* 1 on boards whose serial monitor does not echo what you type */
 #define LAYA_ECHO 0
+#endif
+#ifndef LAYA_BANNER /* 0: none, 1: Trivikrama picture, 2: Vamana story animation */
+#define LAYA_BANNER 1
+#endif
+#ifndef LAYA_COLUMNS /* serial monitors: assume 80 columns (the 60-column picture) */
+#define LAYA_COLUMNS 80
 #endif
 #ifndef LAYA_TILE_BYTES
 #define LAYA_TILE_BYTES (64u * 1024u)
@@ -150,6 +163,24 @@ done:
     return ret;
 }
 
+static int terminal_columns(void)
+{
+#if (defined(__unix__) || defined(__APPLE__)) && defined(TIOCGWINSZ)
+    struct winsize w;
+    if (ioctl(fileno(stdout), TIOCGWINSZ, &w) == 0 && w.ws_col) return w.ws_col;
+#endif
+    return LAYA_COLUMNS;
+}
+
+static int interactive(void)
+{
+#if defined(__unix__) || defined(__APPLE__)
+    return isatty(fileno(stdout)) && isatty(fileno(stdin));
+#else
+    return 1; /* a board's serial monitor */
+#endif
+}
+
 int laya_cli_main(const char *model_path, const char *questions_path)
 {
     static trv_laya ly;
@@ -180,6 +211,7 @@ int laya_cli_main(const char *model_path, const char *questions_path)
         free(qbuf);
         return 1;
     }
+    if (LAYA_BANNER) trivi_banner(LAYA_BANNER, interactive(), terminal_columns());
     printf("Laya on Trivikrama: %u questions:", (unsigned)lt.n_questions);
     for (i = 0; i < lt.n_questions; ++i)
         printf(" %.*s", (int)lt.questions[i].name_len, lt.questions[i].name);
