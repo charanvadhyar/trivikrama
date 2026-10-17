@@ -57,8 +57,11 @@ def build_tokenizer(path, vocab_size=1500):
                              show_progress=False)
     tok.train_from_iterator(CORPUS * 40, tr)
     tok.add_special_tokens([AddedToken("[MASK]", lstrip=True)])
-    tok.add_tokens([AddedToken("|||IP_ADDRESS|||"), AddedToken("<|endoftext|>", rstrip=True)])
+    # like GPT-NeoX / ModernBERT: runs of spaces as added (normalized) tokens
+    tok.add_tokens([AddedToken("|||IP_ADDRESS|||"), AddedToken("<|endoftext|>", rstrip=True),
+                    AddedToken("  "), AddedToken("    "), AddedToken("\t\t")])
     tok.save(path)
+    tok = Tokenizer.from_file(path)
     return tok
 
 
@@ -76,6 +79,11 @@ def samples(seed=0):
              "<|endoftext|>", "₹", "Ω", "ﬁ"]
     for _ in range(3000):
         out.append("".join(r.choice(words) for _ in range(r.randint(1, 12))))
+    for a in range(5):  # whitespace runs next to added tokens (lstrip / rstrip overlaps)
+        for b in range(5):
+            for tok in ("[MASK]", "<|endoftext|>", "[CLS]", "|||IP_ADDRESS|||"):
+                out.append("x" + " " * a + tok + " " * b + "y")
+                out.append(" " * a + tok + "\t" * b)
     pool = [chr(c) for c in list(range(32, 0x250)) + list(range(0x300, 0x370)) +
             list(range(0xC00, 0xC80)) + list(range(0x1100, 0x1200)) + list(range(0xAC00, 0xAC40)) +
             list(range(0x1E00, 0x1F00)) + list(range(0x2000, 0x2070)) + list(range(0x3000, 0x3040)) +
@@ -98,6 +106,16 @@ def main(binary):
         tj = os.path.join(tmp, "tokenizer.json")
         hf = build_tokenizer(tj)
         tables = lt.load_tokenizer_json(tj)
+        # like GPT-NeoX / ModernBERT, a vocabulary may lack bytes UTF-8 never uses
+        j = json.load(open(tj))
+        b2u = lt.bytes_to_unicode()
+        for b in (0xC0, 0xC1, 0xF5, 0xFF):
+            j["model"]["vocab"].pop(b2u[b])
+        try:
+            lt.load_tokenizer_json(j)
+            check("vocabulary without the bytes UTF-8 never uses", True)
+        except ValueError as e:
+            check("vocabulary without the bytes UTF-8 never uses", False, str(e))
         classes, nfc = lt.char_classes(), lt.nfc_tables()
         mirror = lt.TextTokenizer(tables, classes, nfc)
         vocab = json.load(open(tj))["model"]["vocab"]

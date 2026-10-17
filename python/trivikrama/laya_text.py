@@ -30,6 +30,7 @@ import unicodedata
 MAGIC = b"TRLT"
 VERSION = 1
 FLAG_NFC = 1
+NO_ID = 0xFFFFFFFF  # byte with no token (never produced by valid UTF-8)
 
 CLS_OTHER, CLS_LETTER, CLS_NUMBER, CLS_SPACE = 0, 1, 2, 3
 WHITESPACE = [9, 10, 11, 12, 13, 32, 0x85, 0xA0, 0x1680, *range(0x2000, 0x200B),
@@ -194,10 +195,12 @@ def load_tokenizer_json(path):
            "BPE options (dropout / byte_fallback / ignore_merges / prefixes)")
     vocab = m["vocab"]
     b2u = bytes_to_unicode()
-    byte_ids = []
-    for b in range(256):
-        _check(b2u[b] in vocab, f"byte {b} missing from the vocabulary")
-        byte_ids.append(vocab[b2u[b]])
+    # Bytes that never occur in UTF-8 (0xC0, 0xC1, 0xF5-0xFF) may be missing from
+    # the vocabulary; tokenizers skips a missing symbol when there is no unk token.
+    byte_ids = [vocab.get(b2u[b], NO_ID) for b in range(256)]
+    missing = [b for b in range(256) if byte_ids[b] == NO_ID]
+    _check(all(b in (0xC0, 0xC1) or b >= 0xF5 for b in missing),
+           f"bytes {missing} missing from the vocabulary")
     merges = []
     for rank, mg in enumerate(m["merges"]):
         a, b = mg if isinstance(mg, list) else mg.split(" ", 1)
@@ -214,7 +217,7 @@ def load_tokenizer_json(path):
         _check(unicodedata.normalize("NFC", t["content"]) == t["content"],
                f"added token {t['content']!r} changes under NFC")
         added.append((t["id"], t["content"].encode("utf-8"), bool(t.get("lstrip")),
-                       bool(t.get("rstrip"))))
+                       bool(t.get("rstrip")), bool(t.get("normalized", not t.get("special")))))
     return {"nfc": bool(norms), "byte_ids": byte_ids, "merges": sorted(uniq),
             "added": added}
 
@@ -328,7 +331,7 @@ class TextTokenizer:
 
     # -- BPE --
     def bpe(self, data):
-        ids = [self.t["byte_ids"][b] for b in data]
+        ids = [self.t["byte_ids"][b] for b in data if self.t["byte_ids"][b] != NO_ID]
         while len(ids) > 1:
             best, at = None, -1
             for p in range(len(ids) - 1):
@@ -340,49 +343,59 @@ class TextTokenizer:
             ids[at:at + 2] = [best[1]]
         return ids
 
-    def _split_added(self, text):
-        """[(is_added, str or id)]: leftmost-longest match of added tokens, lstrip/rstrip."""
+    def _split(self, text, normalized):
+        """[(id or None, start, stop)] exactly like tokenizers' AddedVocabulary.find_matches:
+        leftmost-longest non-overlapping matches, then lstrip/rstrip widen a match's span
+        (a later match inside the widened span is still emitted, as tokenizers does)."""
         ws = set(map(chr, WHITESPACE))
-        added = [(tid, content.decode("utf-8"), ls, rs) for tid, content, ls, rs in self.t["added"]]
-        out, i, start = [], 0, 0
+        toks = [(tid, content.decode("utf-8"), ls, rs) for tid, content, ls, rs, nm in
+                self.t["added"] if nm == normalized and content]
+        out, i, start_offset = [], 0, 0
         while i < len(text):
             best = None
-            for tok in added:
-                if tok[1] and text.startswith(tok[1], i) and (best is None or
-                                                               len(tok[1]) > len(best[1])):
+            for tok in toks:
+                if text.startswith(tok[1], i) and (best is None or len(tok[1]) > len(best[1])):
                     best = tok
             if best is None:
                 i += 1
                 continue
             tid, content, ls, rs = best
-            a, b = i, i + len(content)
+            start, stop = i, i + len(content)
+            i = stop
             if ls:
-                while a > start and text[a - 1] in ws:
-                    a -= 1
+                k = start
+                while k > 0 and text[k - 1] in ws:
+                    k -= 1
+                start = max(k, start_offset)
             if rs:
-                while b < len(text) and text[b] in ws:
-                    b += 1
-            if a > start:
-                out.append((False, text[start:a]))
-            out.append((True, tid))
-            start = i = b
-        if start < len(text):
-            out.append((False, text[start:]))
+                while stop < len(text) and text[stop] in ws:
+                    stop += 1
+            if start_offset < start:
+                out.append((None, start_offset, start))
+            out.append((tid, start, stop))
+            start_offset = stop
+        if start_offset < len(text):
+            out.append((None, start_offset, len(text)))
         return out
 
     def encode(self, text):
         if isinstance(text, bytes):
             text = text.decode("utf-8", errors="replace")
         ids = []
-        for is_added, part in self._split_added(text):
-            if is_added:
-                ids.append(part)
+        for tid, a, b in self._split(text, False):        # special tokens, on the raw text
+            if tid is not None:
+                ids.append(tid)
                 continue
-            cps = [ord(c) for c in part]
+            cps = [ord(c) for c in text[a:b]]
             if self.t["nfc"]:
                 cps = self.nfc(cps)
-            for piece in self.pretokenize(cps):
-                ids += self.bpe("".join(map(chr, piece)).encode("utf-8"))
+            norm = "".join(map(chr, cps))
+            for tid2, c, d in self._split(norm, True):     # normalized added tokens
+                if tid2 is not None:
+                    ids.append(tid2)
+                    continue
+                for piece in self.pretokenize(cps[c:d]):
+                    ids += self.bpe("".join(map(chr, piece)).encode("utf-8"))
         return ids
 
 
@@ -453,8 +466,8 @@ def write_tlq(path, tables, questions, sep_id, mask_token="[MASK]", classes=None
     out.append(_u32(len(tables["merges"])))
     out += [_u32(*m) for m in tables["merges"]]
     out.append(_u32(len(tables["added"])))
-    for tid, content, ls, rs in tables["added"]:
-        out.append(_u32(tid, ls | (rs << 1)) + _blob(content))
+    for tid, content, ls, rs, nm in tables["added"]:
+        out.append(_u32(tid, ls | (rs << 1) | (nm << 2)) + _blob(content))
     out.append(_u32(len(questions)))
     for qid, qtype, head, markers, room, slot_option, names in questions:
         out.append(_u32(qtype, len(markers), len(head), room))

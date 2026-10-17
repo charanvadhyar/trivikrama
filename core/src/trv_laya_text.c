@@ -264,20 +264,12 @@ static int is_space_cp(uint32_t c)
            c == 0x205F || c == 0x3000;
 }
 
-/* start of the code point that ends at pos (pos > start) */
-static size_t utf8_prev(const uint8_t *s, size_t start, size_t pos)
-{
-    size_t p = pos - 1;
-    while (p > start && (s[p] & 0xC0) == 0x80 && pos - p < 4) --p;
-    return p;
-}
-
 /* ---- tokenizer ------------------------------------------------------------------ */
 
 size_t trv_laya_tokenize_work_words(size_t len)
 {
-    /* text copy + code points (NFC may expand 4x) + BPE ids of one piece */
-    return len / 4 + 2 + 4 * len + 4 + 16 * len + 16;
+    /* text copy + code points + NFC of a piece (may expand 4x) + BPE ids of a piece */
+    return len / 4 + 2 + len + 1 + 4 * len + 4 + 16 * len + 16;
 }
 
 typedef struct {
@@ -285,6 +277,8 @@ typedef struct {
     uint32_t *ids, max_ids, n;
     uint32_t *bpe;            /* scratch for one piece */
     size_t bpe_cap;
+    uint32_t *norm;           /* NFC output of one piece */
+    size_t norm_cap;
 } out_t;
 
 static void emit(out_t *o, uint32_t id)
@@ -307,7 +301,8 @@ static int put_utf8(uint32_t *dst, size_t cap, size_t *n, uint32_t c, const uint
         b[2] = (uint8_t)(0x80 | ((c >> 6) & 0x3F)); b[3] = (uint8_t)(0x80 | (c & 0x3F)); m = 4;
     }
     if (*n + m > cap) return -1;
-    for (k = 0; k < m; ++k) dst[(*n)++] = byte_ids[b[k]];
+    for (k = 0; k < m; ++k) /* a byte without a token is skipped, as in tokenizers */
+        if (byte_ids[b[k]] != UINT32_MAX) dst[(*n)++] = byte_ids[b[k]];
     return 0;
 }
 
@@ -339,16 +334,15 @@ static int bpe_piece(out_t *o, const uint32_t *cps, size_t n)
     return 0;
 }
 
-/* NFC of cps[0..n) in place (the buffer has room for the decomposition) */
-static size_t nfc(const trv_laya_text *lt, const uint8_t *s, size_t len, uint32_t *cp,
+/* NFC of in[0..n) into out (room for the 4x decomposition) */
+static size_t nfc(const trv_laya_text *lt, const uint32_t *in, size_t n_in, uint32_t *cp,
                   size_t cap, int *err)
 {
-    size_t i = 0, n = 0, a, b, out;
+    size_t i, n = 0, a, b, out;
     uint32_t starter_valid = 0, last = 0;
     size_t starter = 0;
-    /* decompose while decoding */
-    while (i < len) {
-        uint32_t c = utf8_next(s, len, &i);
+    for (i = 0; i < n_in; ++i) { /* decompose */
+        uint32_t c = in[i];
         if (!(lt->flags & 1u)) {
             if (n >= cap) { *err = 1; return 0; }
             cp[n++] = c;
@@ -406,13 +400,11 @@ static size_t nfc(const trv_laya_text *lt, const uint8_t *s, size_t len, uint32_
     return out;
 }
 
-/* GPT-2 split + BPE of one stretch of text without added tokens */
-static int encode_plain(out_t *o, const uint8_t *s, size_t len, uint32_t *cp, size_t cap)
+/* GPT-2 split + BPE of cp[i0..n) (no added tokens inside) */
+static int pretokenize_bpe(out_t *o, const uint32_t *cp, size_t i, size_t n)
 {
     const trv_laya_text *lt = o->lt;
-    int err = 0;
-    size_t n = nfc(lt, s, len, cp, cap, &err), i = 0, j;
-    if (err) return -1;
+    size_t j;
     while (i < n && o->n < o->max_ids) {
         uint32_t c = cp[i], nx = i + 1 < n ? cp[i + 1] : UINT32_MAX, k;
         if (c == 0x27 && (nx == 's' || nx == 't' || nx == 'm' || nx == 'd')) {
@@ -435,24 +427,106 @@ static int encode_plain(out_t *o, const uint8_t *s, size_t len, uint32_t *cp, si
     return 0;
 }
 
+/* length in code points of an added token if it matches cp at i, else 0 */
+static size_t added_match(const uint8_t *content, uint32_t len, const uint32_t *cp, size_t i,
+                          size_t n)
+{
+    size_t p = 0, k = 0;
+    while (p < len) {
+        if (i + k >= n || utf8_next(content, len, &p) != cp[i + k]) return 0;
+        ++k;
+    }
+    return k;
+}
+
+typedef int (*gap_fn)(out_t *o, const uint32_t *cp, size_t a, size_t b);
+
+/*
+ * Added tokens of one kind (normalized or not) in cp[0..n), exactly like
+ * tokenizers' AddedVocabulary::find_matches: leftmost-longest non-overlapping
+ * matches; lstrip / rstrip then widen a match over whitespace (a later match
+ * inside the widened span is still emitted, as tokenizers does). Text between
+ * matches goes to gap().
+ */
+static int split_added(out_t *o, const uint32_t *cp, size_t n, uint32_t normalized, gap_fn gap)
+{
+    const trv_laya_text *lt = o->lt;
+    size_t i = 0, start_offset = 0, k;
+    while (i < n && o->n < o->max_ids) {
+        const uint8_t *rec = lt->added;
+        size_t best_len = 0;
+        uint32_t best_id = 0, best_flags = 0;
+        for (k = 0; k < lt->n_added; ++k) {
+            uint32_t id, fl, l;
+            size_t m;
+            memcpy(&id, rec, 4);
+            memcpy(&fl, rec + 4, 4);
+            memcpy(&l, rec + 8, 4);
+            if (((fl >> 2) & 1u) == normalized && l &&
+                (m = added_match(rec + 12, l, cp, i, n)) > best_len) {
+                best_len = m;
+                best_id = id;
+                best_flags = fl;
+            }
+            rec += 12 + ((l + 3u) & ~3u);
+        }
+        if (!best_len) {
+            ++i;
+            continue;
+        }
+        {
+            size_t start = i, stop = i + best_len;
+            i = stop;
+            if (best_flags & 1u) { /* lstrip */
+                size_t q = start;
+                while (q > 0 && is_space_cp(cp[q - 1])) --q;
+                start = q > start_offset ? q : start_offset;
+            }
+            if (best_flags & 2u) /* rstrip */
+                while (stop < n && is_space_cp(cp[stop])) ++stop;
+            if (start_offset < start && gap(o, cp, start_offset, start)) return -1;
+            emit(o, best_id);
+            start_offset = stop;
+        }
+    }
+    if (start_offset < n && o->n < o->max_ids && gap(o, cp, start_offset, n)) return -1;
+    return 0;
+}
+
+/* a stretch of normalized text between normalized added tokens */
+static int gap_normalized(out_t *o, const uint32_t *cp, size_t a, size_t b)
+{
+    return pretokenize_bpe(o, cp, a, b);
+}
+
+/* a stretch of raw text between special tokens: NFC, then normalized added tokens */
+static int gap_raw(out_t *o, const uint32_t *cp, size_t a, size_t b)
+{
+    int err = 0;
+    size_t m = nfc(o->lt, cp + a, b - a, o->norm, o->norm_cap, &err);
+    if (err) return -1;
+    return split_added(o, o->norm, m, 1u, gap_normalized);
+}
+
 int32_t trv_laya_tokenize(const trv_laya_text *lt, const char *text, size_t len,
                           uint32_t *ids, uint32_t max_ids, uint32_t *work, size_t work_words)
 {
     uint8_t *t;
-    uint32_t *cp;
-    size_t tl = 0, i = 0, start = 0, cap, k;
+    uint32_t *raw;
+    size_t tl = 0, i = 0, n = 0;
     out_t o;
 
     if (!lt || (!text && len) || !ids || !work) return TRV_ERR_ARG;
     if (work_words < trv_laya_tokenize_work_words(len)) return TRV_ERR_BUFFER;
     t = (uint8_t *)work;
-    cp = work + len / 4 + 2;
-    cap = 4 * len + 4;
+    raw = work + len / 4 + 2;
     o.lt = lt;
     o.ids = ids;
     o.max_ids = max_ids;
     o.n = 0;
-    o.bpe = cp + cap;
+    o.norm = raw + len + 1;
+    o.norm_cap = 4 * len + 4;
+    o.bpe = o.norm + o.norm_cap;
     o.bpe_cap = 16 * len + 16;
 
     /* Laya: text.replace(mask_token, " ") */
@@ -465,51 +539,9 @@ int32_t trv_laya_tokenize(const trv_laya_text *lt, const char *text, size_t len,
             t[tl++] = (uint8_t)text[i++];
         }
     }
+    for (i = 0; i < tl;) raw[n++] = utf8_next(t, tl, &i);
 
-    /* split out added tokens: leftmost-longest, with lstrip / rstrip */
-    for (i = 0; i < tl && o.n < max_ids;) {
-        const uint8_t *rec = lt->added, *best = NULL;
-        uint32_t best_len = 0, best_id = 0, best_flags = 0;
-        for (k = 0; k < lt->n_added; ++k) {
-            uint32_t id, fl, l;
-            memcpy(&id, rec, 4);
-            memcpy(&fl, rec + 4, 4);
-            memcpy(&l, rec + 8, 4);
-            if (l && l > best_len && i + l <= tl && memcmp(t + i, rec + 12, l) == 0) {
-                best = rec;
-                best_len = l;
-                best_id = id;
-                best_flags = fl;
-            }
-            rec += 12 + ((l + 3u) & ~3u);
-        }
-        if (!best) {
-            ++i;
-            continue;
-        }
-        {
-            size_t a = i, b = i + best_len;
-            if (best_flags & 1u) { /* lstrip: swallow whitespace before it */
-                while (a > start) {
-                    size_t p = utf8_prev(t, start, a), q = p;
-                    if (!is_space_cp(utf8_next(t, tl, &q))) break;
-                    a = p;
-                }
-            }
-            if (best_flags & 2u) { /* rstrip */
-                while (b < tl) {
-                    size_t q = b;
-                    if (!is_space_cp(utf8_next(t, tl, &q))) break;
-                    b = q;
-                }
-            }
-            if (a > start && encode_plain(&o, t + start, a - start, cp, cap)) return TRV_ERR_BUFFER;
-            emit(&o, best_id);
-            start = i = b;
-        }
-    }
-    if (start < tl && o.n < max_ids && encode_plain(&o, t + start, tl - start, cp, cap))
-        return TRV_ERR_BUFFER;
+    if (split_added(&o, raw, n, 0u, gap_raw)) return TRV_ERR_BUFFER;
     return (int32_t)(o.n < max_ids ? o.n : max_ids);
 }
 
