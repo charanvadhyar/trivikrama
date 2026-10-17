@@ -85,6 +85,11 @@ trv_status trv_model_find(const trv_model *m, const char *name, trv_tensor *out)
 trv_status trv_model_get(const trv_model *m, uint32_t index, char *name_out,
                          trv_tensor *out);
 
+/* Walk the table in one pass. Start with *pos = m->table_offset and call
+ * n_tensors times; name_out must hold TRV_MAX_NAME + 1 chars. */
+trv_status trv_model_next(const trv_model *m, uint32_t *pos, char *name_out,
+                          trv_tensor *out);
+
 uint32_t trv_tensor_numel(const trv_tensor *t);
 
 /* Read raw bytes [byte_off, byte_off + n) of a tensor's data. */
@@ -109,6 +114,24 @@ trv_status trv_tensor_read_q8_row(const trv_model *m, const trv_tensor *t,
 void trv_quantize_act_q8(const float *x, uint32_t T, uint32_t K, uint32_t ldx,
                          int8_t *xq, float *xscale);
 
+/* Group-wise version: every run of `group` values in a row gets its own scale.
+ * K must be a multiple of group.
+ *   xq      [T x K] written with row stride ldq
+ *   xscale  [T x K/group] written with row stride lds
+ * Writing into a column slice (xq + col, xscale + col/group) lets a caller
+ * quantize a wide activation piece by piece, e.g. one attention head or one
+ * FFN chunk at a time, without ever holding the whole row in float. */
+void trv_quantize_act_q8g(const float *x, uint32_t T, uint32_t K, uint32_t ldx,
+                          uint32_t group, int8_t *xq, uint32_t ldq,
+                          float *xscale, uint32_t lds);
+
+/* LayerNorm fused with group-wise quantization: reads x, writes only the int8
+ * result, so the normalized activations never need a float buffer.
+ * beta may be NULL. xq is [T x D] contiguous, xscale is [T x D/group]. */
+void trv_layernorm_quantize(const float *x, uint32_t T, uint32_t D, uint32_t ldx,
+                            const float *gamma, const float *beta, float eps,
+                            uint32_t group, int8_t *xq, float *xscale);
+
 /* Streamed linear layer: y[t][n - n_begin] = sum_k x[t][k] * W[n][k] + bias[n]
  * for output columns n in [n_begin, n_end).
  *
@@ -126,6 +149,18 @@ trv_status trv_linear_q8_stream(const trv_model *m, const trv_tensor *w,
                                 const float *bias, uint32_t n_begin, uint32_t n_end,
                                 float *y, uint32_t ldy,
                                 void *tile_buf, uint32_t tile_bytes);
+
+/* General form of the streamed linear layer.
+ *   group       input quantization group size (xscale is [T x K/group]);
+ *               pass K for per-token scales
+ *   accumulate  0: y = Wx + b    1: y += Wx + b   (adds straight into a
+ *               residual stream, so no extra output buffer is needed) */
+trv_status trv_linear_q8g_stream(const trv_model *m, const trv_tensor *w,
+                                 const int8_t *xq, const float *xscale,
+                                 uint32_t group, uint32_t T,
+                                 const float *bias, uint32_t n_begin, uint32_t n_end,
+                                 float *y, uint32_t ldy, int accumulate,
+                                 void *tile_buf, uint32_t tile_bytes);
 
 /* In-place LayerNorm over the last dimension. beta may be NULL (ModernBERT). */
 void trv_layernorm(float *x, uint32_t T, uint32_t D, uint32_t ldx,

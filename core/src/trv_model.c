@@ -61,6 +61,13 @@ static trv_status read_entry(const trv_model *m, uint32_t *pos, char *name,
     return TRV_OK;
 }
 
+trv_status trv_model_next(const trv_model *m, uint32_t *pos, char *name_out,
+                          trv_tensor *out)
+{
+    if (!m || !pos || !name_out || !out) return TRV_ERR_ARG;
+    return read_entry(m, pos, name_out, out);
+}
+
 trv_status trv_model_get(const trv_model *m, uint32_t index, char *name_out,
                          trv_tensor *out)
 {

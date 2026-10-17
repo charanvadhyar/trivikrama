@@ -8,25 +8,74 @@
 #include <math.h>
 #include <string.h>
 
+static int8_t q8(float v, float s)
+{
+    long q = lrintf(v / s);
+    if (q > 127) q = 127;
+    if (q < -127) q = -127;
+    return (int8_t)q;
+}
+
+void trv_quantize_act_q8g(const float *x, uint32_t T, uint32_t K, uint32_t ldx,
+                          uint32_t group, int8_t *xq, uint32_t ldq,
+                          float *xscale, uint32_t lds)
+{
+    uint32_t t, g0, k;
+    for (t = 0; t < T; ++t) {
+        const float *row = x + (size_t)t * ldx;
+        int8_t *qrow = xq + (size_t)t * ldq;
+        float *srow = xscale + (size_t)t * lds;
+        for (g0 = 0; g0 < K; g0 += group) {
+            float maxabs = 0.0f, s;
+            for (k = g0; k < g0 + group; ++k) {
+                float a = fabsf(row[k]);
+                if (a > maxabs) maxabs = a;
+            }
+            s = (maxabs > 0.0f) ? maxabs / 127.0f : 1.0f;
+            srow[g0 / group] = s;
+            for (k = g0; k < g0 + group; ++k) qrow[k] = q8(row[k], s);
+        }
+    }
+}
+
 void trv_quantize_act_q8(const float *x, uint32_t T, uint32_t K, uint32_t ldx,
                          int8_t *xq, float *xscale)
 {
-    uint32_t t, k;
+    trv_quantize_act_q8g(x, T, K, ldx, K, xq, K, xscale, 1);
+}
+
+void trv_layernorm_quantize(const float *x, uint32_t T, uint32_t D, uint32_t ldx,
+                            const float *gamma, const float *beta, float eps,
+                            uint32_t group, int8_t *xq, float *xscale)
+{
+    uint32_t t, i, g0, ng = D / group;
     for (t = 0; t < T; ++t) {
         const float *row = x + (size_t)t * ldx;
-        int8_t *qrow = xq + (size_t)t * K;
-        float maxabs = 0.0f, s;
-        for (k = 0; k < K; ++k) {
-            float a = fabsf(row[k]);
-            if (a > maxabs) maxabs = a;
+        float mean = 0.0f, var = 0.0f, inv;
+        for (i = 0; i < D; ++i) mean += row[i];
+        mean /= (float)D;
+        for (i = 0; i < D; ++i) {
+            float d = row[i] - mean;
+            var += d * d;
         }
-        s = (maxabs > 0.0f) ? maxabs / 127.0f : 1.0f;
-        xscale[t] = s;
-        for (k = 0; k < K; ++k) {
-            long q = lrintf(row[k] / s);
-            if (q > 127) q = 127;
-            if (q < -127) q = -127;
-            qrow[k] = (int8_t)q;
+        var /= (float)D;
+        inv = 1.0f / sqrtf(var + eps);
+        /* two passes per group: find the scale, then quantize. The normalized
+         * value is recomputed rather than stored, so no float buffer is used. */
+        for (g0 = 0; g0 < D; g0 += group) {
+            float maxabs = 0.0f, s;
+            for (i = g0; i < g0 + group; ++i) {
+                float v = (row[i] - mean) * inv * gamma[i];
+                if (beta) v += beta[i];
+                if (fabsf(v) > maxabs) maxabs = fabsf(v);
+            }
+            s = (maxabs > 0.0f) ? maxabs / 127.0f : 1.0f;
+            xscale[(size_t)t * ng + g0 / group] = s;
+            for (i = g0; i < g0 + group; ++i) {
+                float v = (row[i] - mean) * inv * gamma[i];
+                if (beta) v += beta[i];
+                xq[(size_t)t * D + i] = q8(v, s);
+            }
         }
     }
 }
@@ -37,7 +86,19 @@ trv_status trv_linear_q8_stream(const trv_model *m, const trv_tensor *w,
                                 float *y, uint32_t ldy,
                                 void *tile_buf, uint32_t tile_bytes)
 {
-    uint32_t N, K, rows_per_tile, n0;
+    if (!w || w->ndim != 2) return TRV_ERR_ARG;
+    return trv_linear_q8g_stream(m, w, xq, xscale, w->dims[1], T, bias, n_begin,
+                                 n_end, y, ldy, 0, tile_buf, tile_bytes);
+}
+
+trv_status trv_linear_q8g_stream(const trv_model *m, const trv_tensor *w,
+                                 const int8_t *xq, const float *xscale,
+                                 uint32_t group, uint32_t T,
+                                 const float *bias, uint32_t n_begin, uint32_t n_end,
+                                 float *y, uint32_t ldy, int accumulate,
+                                 void *tile_buf, uint32_t tile_bytes)
+{
+    uint32_t N, K, ng, rows_per_tile, n0;
     uint8_t *buf = (uint8_t *)tile_buf;
 
     if (!m || !w || !xq || !xscale || !y || !tile_buf) return TRV_ERR_ARG;
@@ -45,6 +106,8 @@ trv_status trv_linear_q8_stream(const trv_model *m, const trv_tensor *w,
     N = w->dims[0];
     K = w->dims[1];
     if (n_begin > n_end || n_end > N || K == 0) return TRV_ERR_ARG;
+    if (group == 0 || K % group != 0) return TRV_ERR_ARG;
+    ng = K / group;
 
     rows_per_tile = tile_bytes / (K + 4u);
     if (rows_per_tile == 0) return TRV_ERR_BUFFER;
@@ -71,10 +134,20 @@ trv_status trv_linear_q8_stream(const trv_model *m, const trv_tensor *w,
             memcpy(&ws, buf + 4u * i, 4); /* unaligned-safe */
             for (t = 0; t < T; ++t) {
                 const int8_t *xr = xq + (size_t)t * K;
-                int32_t acc = 0;
-                uint32_t k;
-                for (k = 0; k < K; ++k) acc += (int32_t)xr[k] * (int32_t)wr[k];
-                y[(size_t)t * ldy + (n - n_begin)] = (float)acc * xscale[t] * ws + b;
+                const float *xs = xscale + (size_t)t * ng;
+                float sum = 0.0f, val;
+                uint32_t g, k;
+                for (g = 0; g < ng; ++g) {
+                    int32_t acc = 0;
+                    for (k = g * group; k < (g + 1) * group; ++k)
+                        acc += (int32_t)xr[k] * (int32_t)wr[k];
+                    sum += (float)acc * xs[g];
+                }
+                val = sum * ws + b;
+                if (accumulate)
+                    y[(size_t)t * ldy + (n - n_begin)] += val;
+                else
+                    y[(size_t)t * ldy + (n - n_begin)] = val;
             }
         }
     }
