@@ -143,14 +143,17 @@ class _Quantized:
         return self.base[name]
 
 
+def _token_cosines(outs, refs):
+    return [((a * b).sum(1) / (np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1) + 1e-30))
+            for a, b in zip(outs, refs)]
+
+
 def _mean_cosine(outs, refs):
-    c = [((a * b).sum(1) / (np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1) + 1e-30))
-         for a, b in zip(outs, refs)]
-    c = np.concatenate(c)
+    c = np.concatenate(_token_cosines(outs, refs))
     return float(c.mean()), float(c.min())
 
 
-def choose_precision(w, cfg, calib_ids, target_cosine=0.995, log=print):
+def choose_precision(w, cfg, calib_ids, target_cosine=None, max_drop=0.005, log=print):
     """Pick which layer matrices can be int4 while the encoder output stays close.
 
     1. Run the float model on the calibration sequences and record the input
@@ -158,7 +161,10 @@ def choose_precision(w, cfg, calib_ids, target_cosine=0.995, log=print):
     2. Rank matrices by how much int4 changes *their own output* on those real
        inputs (activation-aware, not just weight error).
     3. Find the largest number k of least-sensitive matrices that can be int4
-       (the rest int8) with mean token cosine to the float output >= target.
+       (the rest int8) while the mean token cosine to the float output stays
+       at least `target_cosine` if given, otherwise at most `max_drop` below
+       the all-int8 model (the default: a relative budget, so a few odd tokens
+       that are hard even for int8 do not block every int4 choice).
 
     Returns (set of int4 names, info dict).
     """
@@ -187,8 +193,18 @@ def choose_precision(w, cfg, calib_ids, target_cosine=0.995, log=print):
                 f"(min {cache[k][1]:.4f})")
         return cache[k][0]
 
-    if quality(0) < target_cosine:
-        log(f"  even all-int8 is below the target {target_cosine}; keeping int8 everywhere")
+    base = quality(0)
+    # show the tokens that are hard even for int8 (outliers drag the mean down)
+    view8 = _Quantized(w, q8, q4, set())
+    per_tok = _token_cosines([float_forward(view8, cfg, ids) for ids in calib_ids], refs)
+    worst = sorted(((float(c[t]), si, t) for si, c in enumerate(per_tok) for t in range(len(c))))[:3]
+    log("  hardest tokens for int8 (cosine, sequence, position, token id): " + ", ".join(
+        f"{c:.3f} s{si} p{t} id{calib_ids[si][t]}" for c, si, t in worst))
+    if target_cosine is None:
+        target_cosine = base - max_drop
+        log(f"  budget: int4 may lower the mean cosine by {max_drop} -> threshold {target_cosine:.5f}")
+    if base < target_cosine:
+        log(f"  even all-int8 ({base:.5f}) is below the target {target_cosine}; keeping int8")
         k = 0
     elif quality(len(names)) >= target_cosine:
         k = len(names)
@@ -203,7 +219,7 @@ def choose_precision(w, cfg, calib_ids, target_cosine=0.995, log=print):
         k = lo
     chosen = set(order[:k])
     info = dict(n_int4=k, n_total=len(names), cosine=cache[k][0], min_cosine=cache[k][1],
-                int8_cosine=cache[0][0], sensitivity=sens)
+                int8_cosine=cache[0][0], threshold=target_cosine, sensitivity=sens)
     return chosen, info
 
 
@@ -225,15 +241,15 @@ def _order_key(name):
 
 
 def export_modernbert(state_dict, cfg, path, group=None, weights="int8", calib_ids=None,
-                      target_cosine=0.995, report=None, log=print):
+                      target_cosine=None, max_drop=0.005, report=None, log=print):
     """Write a ModernBERT encoder to a .trv file. Returns (file_bytes, ignored).
 
     weights:
       "int8"  every layer matrix int8 (the safe default)
       "int4"  every layer matrix int4
       "auto"  calibrated: int4 only where the encoder output on calib_ids stays
-              at mean token cosine >= target_cosine vs. the float model; the
-              rest int8 (see choose_precision)
+              within max_drop (mean token cosine) of the all-int8 model, or
+              above target_cosine if given; the rest int8 (see choose_precision)
     calib_ids: list of token-id lists for "auto"; without it, random ids are
     used, which works mechanically but says little about real text.
     The embedding table always stays int8: only a few rows are read per
@@ -259,10 +275,10 @@ def export_modernbert(state_dict, cfg, path, group=None, weights="int8", calib_i
             log("warning: no calibration text; using random token ids")
             r = np.random.default_rng(0)
             calib_ids = [r.integers(5, cfg["vocab_size"], 16).tolist() for _ in range(4)]
-        use4, info = choose_precision(w, cfg, calib_ids, target_cosine, log=log)
+        use4, info = choose_precision(w, cfg, calib_ids, target_cosine, max_drop, log=log)
         log(f"auto precision: {info['n_int4']}/{info['n_total']} matrices int4, "
             f"mean cosine {info['cosine']:.5f} (all-int8: {info['int8_cosine']:.5f}, "
-            f"target {target_cosine})")
+            f"threshold {info['threshold']:.5f})")
         if report is not None:
             for n, e in sorted(info["sensitivity"].items(), key=lambda kv: _order_key(kv[0])):
                 report.append((n, "int4" if n in use4 else "int8", e))

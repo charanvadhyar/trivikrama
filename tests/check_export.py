@@ -105,6 +105,18 @@ def main(binary):
             counts.append(len(chosen))
         check("stricter target keeps more matrices int8", counts[1] <= counts[0],
               f"{counts[0]} -> {counts[1]} int4 matrices")
+        print("relative budget (default)")
+        path = os.path.join(tmp, "auto_rel.trv")
+        rep_rel = []
+        mb.export_modernbert(sd, CFG, path, weights="auto", calib_ids=calib, max_drop=0.0001,
+                             report=rep_rel, log=lambda *_: None)
+        n_rel = sum(1 for _, d, _ in rep_rel if d == "int4")
+        c8 = run_c(binary, os.path.join(tmp, "nested.trv"), ids, tmp)
+        crel = run_c(binary, path, ids, tmp)
+        drop = cosine(c8, ref) - cosine(crel, ref)
+        check("max_drop budget is respected (relative to int8)", drop < 0.0001 + 0.0005,
+              f"{n_rel}/{len(rep_rel)} int4, cosine drop {drop:.5f} vs int8")
+
         sens = dict((n, e) for n, _, e in rep)
         least = min(sens, key=sens.get)
         check("least sensitive matrix is chosen first",

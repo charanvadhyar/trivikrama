@@ -124,7 +124,8 @@ def cmd_export_modernbert(args):
     report = []
     size, ignored = export_modernbert(state, cfg, args.output, group=args.group,
                                       weights=args.weights, calib_ids=calib,
-                                      target_cosine=args.target_cosine, report=report)
+                                      target_cosine=args.target_cosine,
+                                      max_drop=args.max_drop, report=report)
     print(f"wrote {args.output}: {size / 1e6:.1f} MB ({args.weights} weights)")
     if report:
         sens = sorted(report, key=lambda r: -r[2])[:5]
@@ -176,10 +177,12 @@ def main(argv=None):
                         "model_dir/encoder/config.json)")
     e.add_argument("--weights", choices=["int8", "int4", "auto"], default="int8",
                    help="auto: int4 only where the output on calibration text stays "
-                        "above --target-cosine")
-    e.add_argument("--target-cosine", type=float, default=0.995,
-                   help="auto mode: minimum mean token cosine vs. the float model "
-                        "(default 0.995)")
+                        "close to the all-int8 model")
+    e.add_argument("--max-drop", type=float, default=0.005,
+                   help="auto mode: how much int4 may lower the mean token cosine "
+                        "compared with all-int8 (default 0.005)")
+    e.add_argument("--target-cosine", type=float, default=None,
+                   help="auto mode: use an absolute minimum mean cosine instead of --max-drop")
     e.add_argument("--calib-text", default=None,
                    help="auto mode: text file, one calibration example per line "
                         "(default: built-in samples)")
