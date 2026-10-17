@@ -5,11 +5,8 @@
 Trivikrama runs full-size, pretrained transformer encoders (BERT / ModernBERT family)
 on microcontrollers by **streaming weights from an SD card**, one tile at a time.
 A board with ~100 KB of free RAM can compute a 400M-parameter model, exactly as released,
-if you are willing to wait.
 
-> In the Vamana story, a dwarf asks for three steps of land, then grows into
-> Trivikrama and measures the universe in three strides.
-> The chip is Vamana. The model it runs is Trivikrama.
+
 
 ## The three strides
 
