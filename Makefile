@@ -7,7 +7,7 @@ SRC      = core/src/trv_kernels.c core/src/trv_linear.c core/src/trv_sources.c \
            core/src/trv_modernbert.c
 HDR      = $(wildcard core/include/*.h)
 
-.PHONY: all test test-kernels test-features test-modernbert virtual-mcu clean
+.PHONY: all test test-kernels test-features test-export test-modernbert virtual-mcu clean
 
 all: build/test_kernels build/trv_run
 
@@ -25,11 +25,15 @@ test-kernels: build/test_kernels
 test-features: build/trv_run
 	PYTHONPATH=python python3 tests/check_features.py build/trv_run
 
+# needs: pip install safetensors
+test-export: build/trv_run
+	PYTHONPATH=python python3 tests/check_export.py build/trv_run
+
 # needs: pip install torch transformers
 test-modernbert: build/trv_run
 	PYTHONPATH=python python3 tests/check_modernbert.py build/trv_run
 
-test: test-kernels test-features test-modernbert
+test: test-kernels test-features test-export test-modernbert
 
 # usage: make virtual-mcu MODEL=model.trv
 virtual-mcu: build/trv_run

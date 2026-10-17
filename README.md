@@ -37,7 +37,7 @@ if you are willing to wait.
 | Streamed linear layer, int8 and int4 weights | ✅ verified against NumPy |
 | LayerNorm, GELU, RoPE | ✅ verified against NumPy |
 | Windowed attention with online softmax | ✅ verified against NumPy |
-| ModernBERT encoder forward pass | ✅ matches the NumPy mirror to ~1e-7; Hugging Face check: `make test-modernbert` |
+| ModernBERT encoder forward pass | ✅ matches Hugging Face (`make test-modernbert`); runs the real Laya encoder |
 | Virtual-MCU runner (RAM limits, bytes streamed, MACs) | ✅ |
 | Speed features: int4, mixed precision, multi-core, async prefetch, storage tiers, batching, early exit, token pruning, SIMD hook | ✅ bit-exact against the plain path (`make test-features`) |
 | CI (GitHub Actions) | ✅ |
@@ -95,10 +95,27 @@ microcontroller's SD card (`tools/benchmark.py`):
 Early exit and int4 change the model's output (by design); check the accuracy
 cost on your own model before relying on them. Everything else is exact.
 
+### Accuracy on the real Laya encoder
+
+Laya's released weights, converted with `trivi export-modernbert`, compared
+token by token with Hugging Face's float32 ModernBERT on real sentences:
+
+| Weights | Mean token cosine vs. float32 | Worst token |
+|---|---|---|
+| int8 | 0.994 – 0.999 | 0.98 |
+| int4 everywhere | 0.94 – 0.97 | 0.87 |
+
+int8 is the recommended default. Plain group-wise int4 is too coarse for most
+of a transformer encoder; `--weights auto` measures, per matrix, how much int4
+costs on real inputs and only uses it where the output stays above the target.
+On a Laya-sized model a 0.995 target allows about a fifth of the matrices to
+be int4. Better int4 methods (activation-aware scaling, GPTQ-style rounding)
+are future work.
+
 | Feature | What it does | How to use |
 |---|---|---|
-| int4 weights | 4-bit, groups of 32, fp16 scales: ~45% fewer bytes to stream | `trivi export-modernbert --weights int4` |
-| Mixed precision | int4 only for matrices where its error is small | `--weights auto --int4-max-error 0.12` |
+| int4 weights | 4-bit, groups of 32, fp16 scales (error-minimizing scale search): ~45% fewer bytes | `trivi export-modernbert --weights int4` |
+| Calibrated mixed precision | int4 only for the matrices whose int4 version keeps the model's output on your calibration text above a cosine target | `--weights auto --target-cosine 0.995 --calib-text FILE` |
 | Async prefetch | loads the next weight tile, even the next call's, while computing | give `trv_source` a `read_async` + `wait` (DMA, second core) |
 | Multi-core | splits each tile's rows across cores | `trv_runtime.parallel` + `n_workers` |
 | SIMD hook | swap in a vector int8 dot product (e.g. ESP32-S3 PIE) | `trv_runtime.dot_groups` |
@@ -122,11 +139,13 @@ trv_set_runtime(&rt);
 pip install -e ".[convert]"     # installs the `trivi` CLI
 make test-kernels               # C kernels vs NumPy
 make test-features              # every speed feature is bit-exact vs the plain path
+make test-export                # exporter: nested configs, int4 scale search, calibration
 make test-modernbert            # C ModernBERT vs Hugging Face (needs: pip install torch transformers)
 
 # a real model: download a ModernBERT checkpoint folder, then
-trivi export-modernbert ./ModernBERT-large -o model.trv              # int8
-trivi export-modernbert ./ModernBERT-large -o model4.trv --weights auto  # int4 where safe
+trivi export-modernbert ./ModernBERT-large -o model.trv              # int8 (recommended)
+trivi export-modernbert ./ModernBERT-large -o mixed.trv --weights auto \
+      --target-cosine 0.995 --calib-text my_examples.txt              # int4 only where safe
 make virtual-mcu MODEL=model.trv   # RAM per board, bytes streamed, time estimates
 build/trv_run model.trv --ids 101,2023,2003,102 --dump out/   # per-layer hidden states
 python tools/benchmark.py build/trv_run model.trv model4.trv    # every speed feature
@@ -150,7 +169,7 @@ python/trivikrama/          converter, ModernBERT exporter, NumPy reference, `tr
 tools/trv_run.c             run a model on the PC as a "virtual MCU" (RAM budget, stats)
 tools/virtual_mcu.py        per-board RAM fit and time estimates
 tools/benchmark.py          measure every speed feature on a model
-tests/                      C vs NumPy, features vs plain path, C vs Hugging Face
+tests/                      C vs NumPy, features vs plain path, exporter, C vs Hugging Face
 ```
 
 ## Prior work

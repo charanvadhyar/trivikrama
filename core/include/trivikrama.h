@@ -21,7 +21,7 @@
 extern "C" {
 #endif
 
-#define TRV_VERSION_STRING "0.2.0"
+#define TRV_VERSION_STRING "0.3.0"
 #define TRV_FORMAT_VERSION 1u
 
 typedef enum {

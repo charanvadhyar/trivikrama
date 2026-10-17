@@ -30,11 +30,24 @@ def dequantize_rows_q8(q, scale):
 Q4_GROUP = 32
 
 
-def quantize_q4_g32(x):
+def _q4_with_scale(xg, s16):
+    s16 = np.where(s16 == 0, np.float16(1.0), s16).astype(np.float16)
+    s = s16.astype(np.float32)[..., None]
+    q = np.clip(np.rint(xg / s), -7, 7)
+    err = ((q * s - xg) ** 2).sum(-1)
+    return q.astype(np.int8), s16, err
+
+
+def quantize_q4_g32(x, search=True, steps=21, min_factor=0.6):
     """4-bit symmetric quantization in groups of 32 along each row.
 
     Returns (q int8 in [-7, 7] of shape [N, K], scales float16 [N, K/32]).
     Matches what the C kernel expects: value = q * float(scale).
+
+    search=True tries `steps` scales between min_factor * (max/7) and max/7
+    for every group and keeps the one with the smallest squared error. A
+    slightly smaller scale clips the rare largest value but represents all
+    the others more finely, which usually wins. Costs nothing at runtime.
     """
     x = np.ascontiguousarray(x, dtype=np.float32)
     N, K = x.shape
@@ -42,10 +55,17 @@ def quantize_q4_g32(x):
         raise ValueError(f"int4 needs rows that are a multiple of {Q4_GROUP} long, got {K}")
     xg = x.reshape(N, K // Q4_GROUP, Q4_GROUP)
     m = np.abs(xg).max(-1)
-    s16 = np.where(m > 0, m / np.float32(7.0), np.float32(1.0)).astype(np.float16)
-    s16 = np.where(s16 == 0, np.float16(1.0), s16).astype(np.float16)
-    q = np.clip(np.rint(xg / s16.astype(np.float32)[..., None]), -7, 7).astype(np.int8)
-    return q.reshape(N, K), s16
+    base = np.where(m > 0, m / np.float32(7.0), np.float32(1.0)).astype(np.float32)
+    best_q, best_s, best_err = _q4_with_scale(xg, base.astype(np.float16))
+    if search:
+        for f in np.linspace(min_factor, 1.0, steps, dtype=np.float32)[:-1]:
+            q, s16, err = _q4_with_scale(xg, (base * f).astype(np.float16))
+            better = err < best_err
+            if better.any():
+                best_q = np.where(better[..., None], q, best_q)
+                best_s = np.where(better, s16, best_s)
+                best_err = np.where(better, err, best_err)
+    return best_q.reshape(N, K), best_s.astype(np.float16)
 
 
 def dequantize_q4_g32(q, s16):

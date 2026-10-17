@@ -19,7 +19,8 @@ import numpy as np
 
 from . import reference as ref
 from .format import DTYPE_F32, DTYPE_Q4_G32, DTYPE_Q8_ROWS, read_trv, write_trv
-from .quantize import dequantize_q4_g32, quantize_q4_g32
+from .quantize import (dequantize_q4_g32, dequantize_rows_q8, quantize_q4_g32,
+                       quantize_rows_q8)
 
 _RENAME = [
     (r"embeddings\.tok_embeddings\.weight", "emb.tok"),
@@ -119,6 +120,93 @@ def int4_error(w):
     return float(np.linalg.norm(d - w) / max(np.linalg.norm(w), 1e-30))
 
 
+_MATRIX = re.compile(r"L\d+\.(wqkv|wo|wi|wo_mlp)$")
+
+
+class _Quantized:
+    """Weights view that de-quantizes matrices on access (keeps memory low)."""
+
+    def __init__(self, base, q8, q4, use4):
+        self.base, self.q8, self.q4, self.use4 = base, q8, q4, use4
+
+    def __contains__(self, name):
+        return name in self.base
+
+    def get(self, name, default=None):
+        return self[name] if name in self.base else default
+
+    def __getitem__(self, name):
+        if name in self.q8:
+            if name in self.use4:
+                return dequantize_q4_g32(*self.q4[name])
+            return dequantize_rows_q8(*self.q8[name])
+        return self.base[name]
+
+
+def _mean_cosine(outs, refs):
+    c = [((a * b).sum(1) / (np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1) + 1e-30))
+         for a, b in zip(outs, refs)]
+    c = np.concatenate(c)
+    return float(c.mean()), float(c.min())
+
+
+def choose_precision(w, cfg, calib_ids, target_cosine=0.995, log=print):
+    """Pick which layer matrices can be int4 while the encoder output stays close.
+
+    1. Run the float model on the calibration sequences and record the input
+       of every layer matrix.
+    2. Rank matrices by how much int4 changes *their own output* on those real
+       inputs (activation-aware, not just weight error).
+    3. Find the largest number k of least-sensitive matrices that can be int4
+       (the rest int8) with mean token cosine to the float output >= target.
+
+    Returns (set of int4 names, info dict).
+    """
+    names = sorted((n for n in w if _MATRIX.match(n)), key=_order_key)
+    capture = {}
+    refs = [float_forward(w, cfg, ids, capture=capture) for ids in calib_ids]
+    q8 = {n: quantize_rows_q8(w[n]) for n in names}
+    q4 = {n: quantize_q4_g32(w[n]) for n in names}
+
+    sens = {}
+    for n in names:
+        X = np.concatenate(capture[n]).astype(np.float32)
+        y = X @ w[n].T
+        e = X @ (dequantize_q4_g32(*q4[n]) - w[n]).T
+        sens[n] = float(np.linalg.norm(e) / max(np.linalg.norm(y), 1e-30))
+    order = sorted(names, key=sens.get)
+
+    cache = {}
+
+    def quality(k):
+        if k not in cache:
+            view = _Quantized(w, q8, q4, set(order[:k]))
+            outs = [float_forward(view, cfg, ids) for ids in calib_ids]
+            cache[k] = _mean_cosine(outs, refs)
+            log(f"  int4 for {k:3d}/{len(names)} matrices: mean cosine {cache[k][0]:.5f} "
+                f"(min {cache[k][1]:.4f})")
+        return cache[k][0]
+
+    if quality(0) < target_cosine:
+        log(f"  even all-int8 is below the target {target_cosine}; keeping int8 everywhere")
+        k = 0
+    elif quality(len(names)) >= target_cosine:
+        k = len(names)
+    else:  # quality falls as k grows: binary search the boundary
+        lo, hi = 0, len(names)
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if quality(mid) >= target_cosine:
+                lo = mid
+            else:
+                hi = mid
+        k = lo
+    chosen = set(order[:k])
+    info = dict(n_int4=k, n_total=len(names), cosine=cache[k][0], min_cosine=cache[k][1],
+                int8_cosine=cache[0][0], sensitivity=sens)
+    return chosen, info
+
+
 def _order_key(name):
     """config first, then layers in numeric order, then final norm, embeddings last.
 
@@ -136,15 +224,21 @@ def _order_key(name):
     return (3, 0, name)
 
 
-def export_modernbert(state_dict, cfg, path, group=None, weights="int8", int4_max_error=0.12,
-                      report=None):
+def export_modernbert(state_dict, cfg, path, group=None, weights="int8", calib_ids=None,
+                      target_cosine=0.995, report=None, log=print):
     """Write a ModernBERT encoder to a .trv file. Returns (file_bytes, ignored).
 
-    weights: "int8", "int4", or "auto" (int4 for each layer matrix whose int4
-    reconstruction error is at most int4_max_error, int8 otherwise). The
-    embedding table always stays int8: only a few rows are read per inference,
-    so int4 would save storage but not time. report, if a list, receives
-    (name, chosen dtype name, int4 error) per layer matrix.
+    weights:
+      "int8"  every layer matrix int8 (the safe default)
+      "int4"  every layer matrix int4
+      "auto"  calibrated: int4 only where the encoder output on calib_ids stays
+              at mean token cosine >= target_cosine vs. the float model; the
+              rest int8 (see choose_precision)
+    calib_ids: list of token-id lists for "auto"; without it, random ids are
+    used, which works mechanically but says little about real text.
+    The embedding table always stays int8: only a few rows are read per
+    inference, so int4 would save storage but not time.
+    report, if a list, receives (name, "int4"/"int8", sensitivity) for "auto".
     """
     if weights not in ("int8", "int4", "auto"):
         raise ValueError("weights must be 'int8', 'int4' or 'auto'")
@@ -156,6 +250,23 @@ def export_modernbert(state_dict, cfg, path, group=None, weights="int8", int4_ma
         raise ValueError(f"group {group} must divide head_dim {hd} and intermediate size")
     if weights != "int8" and group % 32 and 32 % group:
         raise ValueError(f"int4 needs the activation group ({group}) and 32 to divide one another")
+
+    use4 = set()
+    if weights == "int4":
+        use4 = {n for n in w if _MATRIX.match(n) and w[n].shape[1] % 32 == 0}
+    elif weights == "auto":
+        if not calib_ids:
+            log("warning: no calibration text; using random token ids")
+            r = np.random.default_rng(0)
+            calib_ids = [r.integers(5, cfg["vocab_size"], 16).tolist() for _ in range(4)]
+        use4, info = choose_precision(w, cfg, calib_ids, target_cosine, log=log)
+        log(f"auto precision: {info['n_int4']}/{info['n_total']} matrices int4, "
+            f"mean cosine {info['cosine']:.5f} (all-int8: {info['int8_cosine']:.5f}, "
+            f"target {target_cosine})")
+        if report is not None:
+            for n, e in sorted(info["sensitivity"].items(), key=lambda kv: _order_key(kv[0])):
+                report.append((n, "int4" if n in use4 else "int8", e))
+
     config = np.array(
         [
             cfg["num_hidden_layers"],
@@ -177,15 +288,10 @@ def export_modernbert(state_dict, cfg, path, group=None, weights="int8", int4_ma
         arr = w[name]
         if arr.ndim != 2:
             dtype = DTYPE_F32
-        elif name == "emb.tok" or weights == "int8" or arr.shape[1] % 32:
-            dtype = DTYPE_Q8_ROWS
-        elif weights == "int4":
+        elif name in use4:
             dtype = DTYPE_Q4_G32
         else:
-            err = int4_error(arr)
-            dtype = DTYPE_Q4_G32 if err <= int4_max_error else DTYPE_Q8_ROWS
-            if report is not None:
-                report.append((name, "int4" if dtype == DTYPE_Q4_G32 else "int8", err))
+            dtype = DTYPE_Q8_ROWS
         tensors.append((name, arr, dtype))
     return write_trv(path, tensors), ignored
 
@@ -256,6 +362,52 @@ def _lin_q8g(xq, xs, G, wq, ws, rows):
     for g in range(ng):
         s = s + acc[:, :, g].astype(F32) * xs[:, None, g]
     return (s * ws[rows][None, :]).astype(F32)
+
+
+def float_forward(weights, cfg, ids, capture=None):
+    """Float32 ModernBERT forward (fast, BLAS matmuls). Returns final hidden states.
+
+    capture, if a dict, collects the input of every layer matrix under its
+    name ("L3.wi" ...), for activation-aware calibration.
+    """
+    L, H = cfg["num_hidden_layers"], cfg["hidden_size"]
+    nh, I = cfg["num_attention_heads"], cfg["intermediate_size"]
+    hd = H // nh
+    eps = float(_get(cfg, "norm_eps", "layer_norm_eps", default=1e-5))
+    settings = cfg.get("layers") or layer_settings(cfg)
+    gb = weights.get
+    keep = (lambda n, x: capture.setdefault(n, []).append(x)) if capture is not None else (
+        lambda n, x: None)
+
+    def ln(x, g, b):
+        mu = x.mean(-1, keepdims=True)
+        v = ((x - mu) ** 2).mean(-1, keepdims=True)
+        y = (x - mu) / np.sqrt(v + F32(eps)) * g
+        return (y + b if b is not None else y).astype(F32)
+
+    h = ln(np.asarray(weights["emb.tok"], dtype=F32)[ids], weights["emb.norm.w"], gb("emb.norm.b"))
+    for i in range(L):
+        half_window, theta = settings[i]
+        p = f"L{i}."
+        x = h if p + "attn_norm.w" not in weights else ln(h, weights[p + "attn_norm.w"],
+                                                          gb(p + "attn_norm.b"))
+        keep(p + "wqkv", x)
+        qkv = x @ weights[p + "wqkv"].T
+        out = np.zeros((len(ids), H), dtype=F32)
+        for hh in range(nh):
+            sl = slice(hh * hd, (hh + 1) * hd)
+            qh = ref.rope(qkv[:, :H][:, sl], 1, hd, base=theta)
+            kh = ref.rope(qkv[:, H:2 * H][:, sl], 1, hd, base=theta)
+            out[:, sl] = ref.attention_head(qh, kh, qkv[:, 2 * H:][:, sl], half_window=half_window)
+        keep(p + "wo", out)
+        h = h + out @ weights[p + "wo"].T
+        x = ln(h, weights[p + "mlp_norm.w"], gb(p + "mlp_norm.b"))
+        keep(p + "wi", x)
+        ag = x @ weights[p + "wi"].T
+        act = (ref.gelu(ag[:, :I]) * ag[:, I:]).astype(F32)
+        keep(p + "wo_mlp", act)
+        h = h + act @ weights[p + "wo_mlp"].T
+    return ln(h, weights["final_norm.w"], gb("final_norm.b"))
 
 
 def load_trv_modernbert(path):
