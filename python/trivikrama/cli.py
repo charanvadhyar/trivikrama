@@ -4,6 +4,10 @@
     trivi export-modernbert ./laya -o laya.trv
     trivi inspect model.trv
 
+    trivi export-laya ./laya -o laya8.trv                  Laya: encoder + decision head
+    trivi laya-prepare --laya ./laya --text "..." --questions guard -o req.trq
+    trivi laya-ask --laya ./laya --model laya8.trv --text "..." --questions guard
+
 Copyright 2026 Vadhyar Sai Charan
 SPDX-License-Identifier: Apache-2.0
 """
@@ -136,6 +140,102 @@ def cmd_export_modernbert(args):
               + (" ..." if len(ignored) > 8 else ""))
 
 
+def cmd_export_laya(args):
+    from .laya import export_laya, load_checkpoint
+
+    ckpt = load_checkpoint(args.model_dir)
+    calib = _calibration_ids(args, ckpt[1]) if args.weights == "auto" else None
+    size, skipped = export_laya(args.model_dir, args.output, weights=args.weights,
+                                calib_ids=calib, max_drop=args.max_drop,
+                                target_cosine=args.target_cosine, checkpoint=ckpt)
+    print(f"wrote {args.output}: {size / 1e6:.1f} MB (encoder {args.weights} + decision head int8)")
+    if skipped:
+        print(f"not used for answers, skipped ({len(skipped)}): " + ", ".join(skipped[:8])
+              + (" ..." if len(skipped) > 8 else ""))
+
+
+def _laya_inputs(args):
+    """(state, questions) from the command line."""
+    import json
+    import os
+
+    if args.state_json:
+        with open(args.state_json) as f:
+            state = json.load(f)
+    elif args.text_file:
+        with open(args.text_file) as f:
+            state = f.read().strip()
+    elif args.text is not None:
+        state = args.text
+    else:
+        sys.exit("give the input with --text, --text-file or --state-json")
+    if args.questions.endswith(".json") and os.path.exists(args.questions):
+        with open(args.questions) as f:
+            questions = json.load(f)
+    else:
+        import laya
+
+        questions = {}
+        for name in args.questions.split(","):
+            name = name.strip()
+            fn = getattr(laya, f"{name}_questions", None)
+            if fn is None:
+                sys.exit(f"laya has no '{name}' preset; pass a questions .json instead")
+            for qid, q in fn().items():
+                questions[qid if "," not in args.questions else f"{name}.{qid}"] = q
+    return state, questions
+
+
+def _find_binary(explicit):
+    import os
+    import shutil
+
+    for cand in [explicit, "build/trv_laya", shutil.which("trv_laya")]:
+        if cand and os.path.exists(cand):
+            return cand
+    sys.exit("build/trv_laya not found: run `make` in the trivikrama folder or pass --binary")
+
+
+def cmd_laya_prepare(args):
+    import json
+
+    from .laya import Preparer, write_request
+
+    state, questions = _laya_inputs(args)
+    rows, meta = Preparer(args.laya).rows(state, questions)
+    write_request(args.output, rows)
+    meta_path = args.output + ".json"
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=1)
+    print(f"wrote {args.output} ({len(rows)} questions, {sum(len(r['ids']) for r in rows)} "
+          f"tokens) and {meta_path}")
+
+
+def cmd_laya_decode(args):
+    import json
+
+    from .laya import decode
+
+    with open(args.meta) as f:
+        meta = json.load(f)
+    with open(args.result) as f:
+        out = json.load(f)
+    print(json.dumps(decode([r["probs"] for r in out["rows"]], meta), indent=1))
+
+
+def cmd_laya_ask(args):
+    import json
+
+    from .laya import Preparer, decode, run_device
+
+    state, questions = _laya_inputs(args)
+    rows, meta = Preparer(args.laya).rows(state, questions)
+    probs, stats = run_device(_find_binary(args.binary), args.model, rows, threads=args.threads)
+    print(json.dumps(decode(probs, meta), indent=1))
+    print(f"{len(rows)} questions, {stats['tokens']} tokens, {stats['seconds']:.2f} s, "
+          f"{stats['ram_bytes'] / 1e6:.1f} MB RAM", file=sys.stderr)
+
+
 def cmd_inspect(args):
     tensors = read_trv(args.input, dequantize=False)
     total = 0
@@ -191,6 +291,47 @@ def main(argv=None):
                         "or model_dir)")
     e.add_argument("--calib-max-tokens", type=int, default=128)
     e.set_defaults(func=cmd_export_modernbert)
+
+    x = sub.add_parser("export-laya",
+                       help="export Laya (encoder + decision head) for the C runtime")
+    x.add_argument("model_dir", help="Laya folder (model.safetensors, encoder/, tokenizer/)")
+    x.add_argument("-o", "--output", required=True)
+    x.add_argument("--weights", choices=["int8", "int4", "auto"], default="int8",
+                   help="encoder weights (int8 recommended for Laya); the head is always int8")
+    x.add_argument("--max-drop", type=float, default=0.005)
+    x.add_argument("--target-cosine", type=float, default=None)
+    x.add_argument("--calib-text", default=None)
+    x.add_argument("--tokenizer", default=None)
+    x.add_argument("--calib-max-tokens", type=int, default=128)
+    x.set_defaults(func=cmd_export_laya)
+
+    def laya_inputs(q):
+        q.add_argument("--laya", default="./laya", help="Laya folder (for its tokenizer)")
+        q.add_argument("--text", default=None, help="the input to decide about")
+        q.add_argument("--text-file", default=None)
+        q.add_argument("--state-json", default=None,
+                       help="a dict/list state (e.g. a conversation) as JSON")
+        q.add_argument("--questions", default="guard",
+                       help="laya presets (guard, moderation, triage, router; comma-separated) "
+                            "or a questions .json file")
+
+    pr = sub.add_parser("laya-prepare",
+                        help="turn text + questions into a request file for the device")
+    laya_inputs(pr)
+    pr.add_argument("-o", "--output", default="request.trq")
+    pr.set_defaults(func=cmd_laya_prepare)
+
+    de = sub.add_parser("laya-decode", help="turn the device's probabilities into answers")
+    de.add_argument("meta", help="request.trq.json from laya-prepare")
+    de.add_argument("result", help="JSON printed by trv_laya")
+    de.set_defaults(func=cmd_laya_decode)
+
+    ak = sub.add_parser("laya-ask", help="prepare, run the C runtime, print Laya's answers")
+    laya_inputs(ak)
+    ak.add_argument("--model", required=True, help=".trv from export-laya")
+    ak.add_argument("--binary", default=None, help="trv_laya program (default: build/trv_laya)")
+    ak.add_argument("--threads", type=int, default=2)
+    ak.set_defaults(func=cmd_laya_ask)
 
     i = sub.add_parser("inspect", help="list the tensors in a .trv file")
     i.add_argument("input")

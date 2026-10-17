@@ -17,6 +17,7 @@ jobs:
       - run: make test-kernels
       - run: make test-features
       - run: make test-export
+      - run: make test-laya
 
   huggingface:
     name: ModernBERT vs Hugging Face

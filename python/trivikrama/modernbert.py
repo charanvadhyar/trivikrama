@@ -237,11 +237,14 @@ def _order_key(name):
         return (1, int(m.group(1)), name)
     if name.startswith("final_norm"):
         return (2, 0, name)
+    if name.startswith("laya."):  # task head: read every inference, right after the encoder
+        return (2, 1, name)
     return (3, 0, name)
 
 
 def export_modernbert(state_dict, cfg, path, group=None, weights="int8", calib_ids=None,
-                      target_cosine=None, max_drop=0.005, report=None, log=print):
+                      target_cosine=None, max_drop=0.005, report=None, log=print,
+                      extra_tensors=None):
     """Write a ModernBERT encoder to a .trv file. Returns (file_bytes, ignored).
 
     weights:
@@ -255,6 +258,8 @@ def export_modernbert(state_dict, cfg, path, group=None, weights="int8", calib_i
     The embedding table always stays int8: only a few rows are read per
     inference, so int4 would save storage but not time.
     report, if a list, receives (name, "int4"/"int8", sensitivity) for "auto".
+    extra_tensors: more (name, array, dtype) entries to store in the same file
+    (e.g. a task head, see trivikrama.laya).
     """
     if weights not in ("int8", "int4", "auto"):
         raise ValueError("weights must be 'int8', 'int4' or 'auto'")
@@ -309,6 +314,8 @@ def export_modernbert(state_dict, cfg, path, group=None, weights="int8", calib_i
         else:
             dtype = DTYPE_Q8_ROWS
         tensors.append((name, arr, dtype))
+    tensors.extend(extra_tensors or [])
+    tensors.sort(key=lambda t: _order_key(t[0]))
     return write_trv(path, tensors), ignored
 
 
