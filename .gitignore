@@ -6,3 +6,8 @@ __pycache__/
 *.egg-info/
 .venv/
 dist/
+laya/
+laya_decisions.json
+/check_decisions.py
+/check_laya.py
+dist/
